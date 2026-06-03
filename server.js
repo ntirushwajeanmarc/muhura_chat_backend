@@ -10,11 +10,21 @@ const { router: authRouter, authenticate } = require('./auth');
 const app = express();
 const server = http.createServer(app);
 
+const clientUrls = (process.env.CLIENT_URL || 'http://localhost:3000').split(',').map(url => url.trim());
+
 const io = new Server(server, {
-  cors: { origin: process.env.CLIENT_URL || 'http://localhost:3000', methods: ['GET', 'POST'] }
+  cors: { origin: clientUrls, methods: ['GET', 'POST'] }
 });
 
-app.use(cors({ origin: process.env.CLIENT_URL || 'http://localhost:3000' }));
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin || clientUrls.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('CORS not allowed'));
+    }
+  }
+}));
 app.use(express.json());
 
 // Routes
