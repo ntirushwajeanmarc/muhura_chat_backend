@@ -12,19 +12,27 @@ const server = http.createServer(app);
 
 const clientUrls = (process.env.CLIENT_URL || 'http://localhost:3000').split(',').map(url => url.trim());
 
-const io = new Server(server, {
-  cors: { origin: clientUrls, methods: ['GET', 'POST'] }
-});
-
-app.use(cors({
+const corsOptions = {
   origin: (origin, callback) => {
     if (!origin || clientUrls.includes(origin)) {
       callback(null, true);
     } else {
       callback(new Error('CORS not allowed'));
     }
-  }
-}));
+  },
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true,
+  preflightContinue: false,
+  optionsSuccessStatus: 204,
+};
+
+const io = new Server(server, {
+  cors: { origin: clientUrls, methods: ['GET', 'POST', 'OPTIONS'] }
+});
+
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 app.use(express.json());
 
 // Routes
