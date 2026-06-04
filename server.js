@@ -17,6 +17,24 @@ const defaultOrigins = [
   'http://127.0.0.1:5173',
 ];
 
+function formatMessageRow(row) {
+  const msg = {
+    id: row.id,
+    content: row.content,
+    created_at: row.created_at,
+    username: row.username,
+    avatar_color: row.avatar_color,
+  };
+  if (row.reply_to_id && row.reply_username) {
+    msg.reply_to = {
+      id: row.reply_to_id,
+      username: row.reply_username,
+      content: row.reply_content,
+    };
+  }
+  return msg;
+}
+
 const allowedOrigins = process.env.CLIENT_URL
   ? process.env.CLIENT_URL.split(',').map((o) => o.trim()).filter(Boolean)
   : defaultOrigins;
@@ -63,17 +81,54 @@ app.get('/api/rooms', authenticate, async (req, res) => {
   }
 });
 
-// Get messages for a room (last 50)
+const MESSAGE_PAGE_SIZE = 50;
+const MESSAGE_PAGE_MAX = 100;
+
+const MESSAGE_SELECT = `
+  SELECT m.id, m.content, m.created_at, m.reply_to_id,
+         u.username, u.avatar_color,
+         ru.username AS reply_username,
+         rm.content AS reply_content
+  FROM messages m
+  JOIN users u ON m.user_id = u.id
+  LEFT JOIN messages rm ON m.reply_to_id = rm.id
+  LEFT JOIN users ru ON rm.user_id = ru.id
+`;
+
+// Paginated messages: ?limit=50&before=<messageId> loads older history
 app.get('/api/rooms/:roomId/messages', authenticate, async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT m.id, m.content, m.created_at, u.username, u.avatar_color
-       FROM messages m JOIN users u ON m.user_id = u.id
-       WHERE m.room_id = $1
-       ORDER BY m.created_at DESC LIMIT 50`,
-      [req.params.roomId]
+    const roomId = req.params.roomId;
+    const limit = Math.min(
+      Math.max(parseInt(req.query.limit, 10) || MESSAGE_PAGE_SIZE, 1),
+      MESSAGE_PAGE_MAX
     );
-    res.json(result.rows.reverse());
+    const beforeId = req.query.before;
+
+    let result;
+    if (beforeId) {
+      result = await pool.query(
+        `${MESSAGE_SELECT}
+         WHERE m.room_id = $1
+           AND m.created_at < (
+             SELECT created_at FROM messages WHERE id = $2 AND room_id = $1
+           )
+         ORDER BY m.created_at DESC
+         LIMIT $3`,
+        [roomId, beforeId, limit]
+      );
+    } else {
+      result = await pool.query(
+        `${MESSAGE_SELECT}
+         WHERE m.room_id = $1
+         ORDER BY m.created_at DESC
+         LIMIT $2`,
+        [roomId, limit]
+      );
+    }
+
+    const rows = result.rows.reverse().map(formatMessageRow);
+    res.json({ messages: rows, hasMore: result.rows.length === limit });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
   }
@@ -115,19 +170,38 @@ io.on('connection', (socket) => {
     io.to(roomId).emit('online_users', [...onlineUsers.get(roomId)]);
   });
 
-  socket.on('send_message', async ({ roomId, content }) => {
+  socket.on('send_message', async ({ roomId, content, replyToId }) => {
     if (!content?.trim()) return;
     try {
+      let replyTo = null;
+      if (replyToId) {
+        const replyRow = await pool.query(
+          `SELECT m.id, m.content, m.room_id, u.username
+           FROM messages m JOIN users u ON m.user_id = u.id
+           WHERE m.id = $1`,
+          [replyToId]
+        );
+        if (replyRow.rows[0]?.room_id === roomId) {
+          replyTo = {
+            id: replyRow.rows[0].id,
+            username: replyRow.rows[0].username,
+            content: replyRow.rows[0].content,
+          };
+        }
+      }
+
       const result = await pool.query(
-        'INSERT INTO messages (room_id, user_id, content) VALUES ($1, $2, $3) RETURNING id, created_at',
-        [roomId, socket.user.id, content.trim()]
+        'INSERT INTO messages (room_id, user_id, content, reply_to_id) VALUES ($1, $2, $3, $4) RETURNING id, created_at',
+        [roomId, socket.user.id, content.trim(), replyTo?.id || null]
       );
       const msg = {
         id: result.rows[0].id,
         content: content.trim(),
         created_at: result.rows[0].created_at,
         username: socket.user.username,
+        avatar_color: socket.user.avatar_color,
         room_id: roomId,
+        reply_to: replyTo,
       };
       io.to(roomId).emit('new_message', msg);
     } catch (err) {
