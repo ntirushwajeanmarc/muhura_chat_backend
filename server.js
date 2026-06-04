@@ -10,16 +10,26 @@ const { router: authRouter, authenticate } = require('./auth');
 const app = express();
 const server = http.createServer(app);
 
-const clientUrls = (process.env.CLIENT_URL || 'https://muhura-chat-frontend.onrender.com').split(',').map(url => url.trim());
-const deployedFrontend = 'https://muhura-chat-frontend.onrender.com';
-if (!clientUrls.includes(deployedFrontend)) clientUrls.push(deployedFrontend);
+const localOrigins = [
+  'http://localhost:3000',
+  'http://127.0.0.1:3000',
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+  'http://localhost:4000',
+  'http://127.0.0.1:4000',
+];
+const clientUrls = (process.env.CLIENT_URL || 'https://muhura-chat-frontend.onrender.com')
+  .split(',')
+  .map(url => url.trim())
+  .filter(Boolean);
+const allowedOrigins = [...new Set([...clientUrls, ...localOrigins])];
 
 const corsOptions = {
   origin: (origin, callback) => {
-    if (!origin || clientUrls.includes(origin)) {
+    if (!origin || allowedOrigins.includes(origin)) {
       callback(null, true);
     } else {
-      callback(new Error('CORS not allowed'));
+      callback(new Error(`CORS policy: Origin ${origin} not allowed`));
     }
   },
   methods: ['GET', 'POST', 'OPTIONS'],
@@ -30,7 +40,7 @@ const corsOptions = {
 };
 
 const io = new Server(server, {
-  cors: { origin: clientUrls, methods: ['GET', 'POST', 'OPTIONS'] }
+  cors: { origin: allowedOrigins, methods: ['GET', 'POST', 'OPTIONS'] }
 });
 
 app.use(cors(corsOptions));
