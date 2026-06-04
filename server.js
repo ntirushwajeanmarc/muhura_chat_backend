@@ -10,12 +10,16 @@ const { router: authRouter, authenticate } = require('./auth');
 const app = express();
 const server = http.createServer(app);
 
-const allowedOrigins = [
+const defaultOrigins = [
   'https://muhura-chat-frontend.onrender.com',
   'https://www.muhura-chat-frontend.onrender.com',
   'http://localhost:5173',
   'http://127.0.0.1:5173',
 ];
+
+const allowedOrigins = process.env.CLIENT_URL
+  ? process.env.CLIENT_URL.split(',').map((o) => o.trim()).filter(Boolean)
+  : defaultOrigins;
 
 const corsOptions = {
   origin: (origin, callback) => {
