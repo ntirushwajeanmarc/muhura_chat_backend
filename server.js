@@ -74,7 +74,11 @@ app.use('/api/auth', authRouter);
 // Get all rooms
 app.get('/api/rooms', authenticate, async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM rooms ORDER BY created_at ASC');
+    const result = await pool.query(
+      `SELECT DISTINCT ON (name) id, name, description, created_by, created_at
+       FROM rooms
+       ORDER BY name, created_at ASC`
+    );
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: 'Server error' });

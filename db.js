@@ -40,13 +40,44 @@ const initDB = async () => {
       CREATE INDEX IF NOT EXISTS idx_messages_room_created ON messages(room_id, created_at DESC);
     `);
 
-    // Seed default rooms
+    // Merge duplicate rooms (keeps oldest per name, moves messages to kept room)
+    await client.query(`
+      WITH keepers AS (
+        SELECT DISTINCT ON (name) id AS keep_id, name
+        FROM rooms
+        ORDER BY name, created_at ASC
+      ),
+      dupes AS (
+        SELECT r.id AS dupe_id, k.keep_id
+        FROM rooms r
+        JOIN keepers k ON r.name = k.name AND r.id <> k.keep_id
+      )
+      UPDATE messages m
+      SET room_id = d.keep_id
+      FROM dupes d
+      WHERE m.room_id = d.dupe_id
+    `);
+    await client.query(`
+      DELETE FROM rooms r
+      USING (
+        SELECT DISTINCT ON (name) id AS keep_id, name
+        FROM rooms
+        ORDER BY name, created_at ASC
+      ) k
+      WHERE r.name = k.name AND r.id <> k.keep_id
+    `);
+
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_rooms_name_unique ON rooms (name)
+    `);
+
+    // Seed default rooms (safe after unique index)
     await client.query(`
       INSERT INTO rooms (name, description) VALUES
         ('general', 'General discussion for everyone'),
         ('study-help', 'Ask questions and get help'),
         ('off-topic', 'Chat about anything')
-      ON CONFLICT DO NOTHING;
+      ON CONFLICT (name) DO NOTHING
     `);
 
     console.log('✅ Database initialized');
