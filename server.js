@@ -12,6 +12,7 @@ const server = http.createServer(app);
 
 const allowedOrigins = [
   'https://muhura-chat-frontend.onrender.com',
+  'https://www.muhura-chat-frontend.onrender.com',
 ];
 
 const corsOptions = {
@@ -19,6 +20,7 @@ const corsOptions = {
     if (!origin || allowedOrigins.includes(origin)) {
       callback(null, true);
     } else {
+      console.warn(`CORS blocked origin: ${origin}`);
       callback(new Error(`CORS policy: Origin ${origin} not allowed`));
     }
   },
