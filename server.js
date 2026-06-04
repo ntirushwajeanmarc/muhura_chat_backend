@@ -13,6 +13,8 @@ const server = http.createServer(app);
 const allowedOrigins = [
   'https://muhura-chat-frontend.onrender.com',
   'https://www.muhura-chat-frontend.onrender.com',
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
 ];
 
 const corsOptions = {
