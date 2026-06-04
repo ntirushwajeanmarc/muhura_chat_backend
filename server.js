@@ -12,7 +12,6 @@ const server = http.createServer(app);
 
 const allowedOrigins = [
   'https://muhura-chat-frontend.onrender.com',
-
 ];
 
 const corsOptions = {
@@ -23,15 +22,20 @@ const corsOptions = {
       callback(new Error(`CORS policy: Origin ${origin} not allowed`));
     }
   },
-  methods: ['GET', 'POST', 'OPTIONS'],
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
+  exposedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
   preflightContinue: false,
-  optionsSuccessStatus: 204,
+  optionsSuccessStatus: 200,
 };
 
 const io = new Server(server, {
-  cors: { origin: allowedOrigins, methods: ['GET', 'POST', 'OPTIONS'] }
+  cors: { 
+    origin: allowedOrigins,
+    methods: ['GET', 'POST'],
+    credentials: true,
+  }
 });
 
 app.use(cors(corsOptions));
