@@ -212,11 +212,20 @@ function mimeFromPath(filePath) {
   return map[ext] || 'application/octet-stream';
 }
 
+function resolveStoredMime(mime, diskPath) {
+  const fromPath = mimeFromPath(diskPath);
+  if (!mime || mime === 'application/octet-stream') return fromPath;
+  if (mime.startsWith('image/')) return mime;
+  if (fromPath.startsWith('image/')) return fromPath;
+  return mime;
+}
+
 function sendStoredFile(res, diskPath, { mime, filename, forceDownload = false }) {
-  res.type(mime || mimeFromPath(diskPath));
+  const resolvedMime = resolveStoredMime(mime, diskPath);
+  res.type(resolvedMime);
   const basename = filename || path.basename(diskPath);
   const safeName = basename.replace(/[^\w.\-() ]+/g, '_') || 'download';
-  const inline = !forceDownload && mime?.startsWith('image/');
+  const inline = !forceDownload && resolvedMime.startsWith('image/');
 
   if (inline) {
     return res.sendFile(diskPath, {
@@ -552,6 +561,10 @@ app.post('/api/rooms/:roomId/upload', authenticate, (req, res) => {
       }
 
       const attachmentUrl = `/uploads/${req.file.filename}`;
+      const fileMime = resolveStoredMime(
+        req.file.mimetype,
+        path.join(UPLOAD_DIR, req.file.filename)
+      );
       const result = await pool.query(
         `INSERT INTO messages (room_id, user_id, content, reply_to_id, attachment_url, attachment_name, attachment_mime)
          VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -563,7 +576,7 @@ app.post('/api/rooms/:roomId/upload', authenticate, (req, res) => {
           replyTo?.id || null,
           attachmentUrl,
           req.file.originalname,
-          req.file.mimetype,
+          fileMime,
         ]
       );
 
