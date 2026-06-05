@@ -555,20 +555,23 @@ const onlineUsers = new Map(); // roomId -> Set of usernames
 io.on('connection', (socket) => {
   console.log(`🔌 ${socket.user.username} connected`);
 
+  // Join a room to receive messages (can join multiple rooms)
   socket.on('join_room', async (roomId) => {
     if (!(await canAccessRoom(socket.user.id, roomId))) return;
-
-    socket.rooms.forEach(r => {
-      if (r !== socket.id) {
-        socket.leave(r);
-        if (onlineUsers.has(r)) {
-          onlineUsers.get(r).delete(socket.user.username);
-          io.to(r).emit('online_users', [...(onlineUsers.get(r) || [])]);
-        }
-      }
-    });
-
     socket.join(roomId);
+  });
+
+  // Track online presence for the room the user is actively viewing
+  socket.on('presence_room', async (roomId) => {
+    if (!(await canAccessRoom(socket.user.id, roomId))) return;
+
+    const prev = socket.data.presenceRoom;
+    if (prev && prev !== roomId && onlineUsers.has(prev)) {
+      onlineUsers.get(prev).delete(socket.user.username);
+      io.to(prev).emit('online_users', [...onlineUsers.get(prev)]);
+    }
+
+    socket.data.presenceRoom = roomId;
     if (!onlineUsers.has(roomId)) onlineUsers.set(roomId, new Set());
     onlineUsers.get(roomId).add(socket.user.username);
     io.to(roomId).emit('online_users', [...onlineUsers.get(roomId)]);
@@ -613,12 +616,11 @@ io.on('connection', (socket) => {
   });
 
   socket.on('disconnect', () => {
-    onlineUsers.forEach((users, roomId) => {
-      if (users.has(socket.user.username)) {
-        users.delete(socket.user.username);
-        io.to(roomId).emit('online_users', [...users]);
-      }
-    });
+    const presenceRoom = socket.data.presenceRoom;
+    if (presenceRoom && onlineUsers.has(presenceRoom)) {
+      onlineUsers.get(presenceRoom).delete(socket.user.username);
+      io.to(presenceRoom).emit('online_users', [...onlineUsers.get(presenceRoom)]);
+    }
     console.log(`🔌 ${socket.user.username} disconnected`);
   });
 });
