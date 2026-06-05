@@ -181,11 +181,46 @@ const io = new Server(server, {
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
 app.use(express.json());
-app.use('/uploads', express.static(UPLOAD_DIR));
+// Files served only via authenticated /api/files (see below)
 
 // Routes
 app.use('/api/auth', authRouter);
 app.use('/api/profile', profileRouter);
+
+// Secure file access — only room members (or avatar owner) can view files
+app.get('/api/files', authenticate, async (req, res) => {
+  try {
+    const urlPath = req.query.path;
+    if (!urlPath || typeof urlPath !== 'string' || !urlPath.startsWith('/uploads/') || urlPath.includes('..')) {
+      return res.status(400).json({ error: 'Invalid path' });
+    }
+
+    const diskPath = path.join(__dirname, urlPath.slice(1));
+    if (!fs.existsSync(diskPath)) {
+      return res.status(404).json({ error: 'File not found' });
+    }
+
+    if (urlPath.includes('/avatars/')) {
+      const owner = await pool.query('SELECT id FROM users WHERE avatar_url = $1', [urlPath]);
+      if (owner.rows[0]) {
+        return res.sendFile(diskPath);
+      }
+    }
+
+    const msg = await pool.query(
+      'SELECT room_id FROM messages WHERE attachment_url = $1 LIMIT 1',
+      [urlPath]
+    );
+    if (msg.rows[0] && (await canAccessRoom(req.user.id, msg.rows[0].room_id))) {
+      return res.sendFile(diskPath);
+    }
+
+    res.status(403).json({ error: 'Access denied' });
+  } catch (err) {
+    console.error('File access error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
 
 // Search users (for starting DMs or adding to groups)
 app.get('/api/users/search', authenticate, async (req, res) => {
@@ -341,6 +376,7 @@ app.post('/api/chats/direct', authenticate, async (req, res) => {
           [roomId, userId, peerId]
         );
         await client.query('COMMIT');
+        notifyRoomAdded(roomId, [userId, peerId]);
       } catch (err) {
         await client.query('ROLLBACK');
         throw err;
@@ -392,6 +428,7 @@ app.post('/api/chats/groups', authenticate, async (req, res) => {
         );
       }
       await client.query('COMMIT');
+      notifyRoomAdded(roomId, allMembers);
 
       res.json({
         id: roomId,
@@ -552,8 +589,34 @@ io.use((socket, next) => {
 // Track online users per room
 const onlineUsers = new Map(); // roomId -> Set of usernames
 
-io.on('connection', (socket) => {
+async function joinSocketToUserRooms(socket) {
+  const userId = socket.user.id;
+  socket.join(`user:${userId}`);
+
+  const memberships = await pool.query(
+    'SELECT room_id FROM room_members WHERE user_id = $1',
+    [userId]
+  );
+  for (const row of memberships.rows) {
+    socket.join(row.room_id);
+  }
+
+  const publicRooms = await pool.query("SELECT id FROM rooms WHERE type = 'public'");
+  for (const row of publicRooms.rows) {
+    socket.join(row.id);
+  }
+}
+
+function notifyRoomAdded(roomId, userIds) {
+  const uniqueIds = [...new Set(userIds.filter(Boolean))];
+  uniqueIds.forEach((userId) => {
+    io.to(`user:${userId}`).emit('room_added', { roomId });
+  });
+}
+
+io.on('connection', async (socket) => {
   console.log(`🔌 ${socket.user.username} connected`);
+  await joinSocketToUserRooms(socket);
 
   // Join a room to receive messages (can join multiple rooms)
   socket.on('join_room', async (roomId) => {
