@@ -321,12 +321,13 @@ app.post('/api/chats/direct', authenticate, async (req, res) => {
     if (existing.rows[0]) {
       roomId = existing.rows[0].id;
     } else {
+      const dmName = `__dm__${[userId, peerId].sort().join('__')}`;
       const client = await pool.connect();
       try {
         await client.query('BEGIN');
         const room = await client.query(
-          `INSERT INTO rooms (type, created_by) VALUES ('direct', $1) RETURNING id`,
-          [userId]
+          `INSERT INTO rooms (name, type, created_by) VALUES ($1, 'direct', $2) RETURNING id`,
+          [dmName, userId]
         );
         roomId = room.rows[0].id;
         await client.query(

@@ -33,6 +33,7 @@ const initDB = async () => {
       );
 
       ALTER TABLE rooms ADD COLUMN IF NOT EXISTS type VARCHAR(20) DEFAULT 'public';
+      ALTER TABLE rooms ALTER COLUMN name DROP NOT NULL;
 
       CREATE TABLE IF NOT EXISTS room_members (
         room_id UUID REFERENCES rooms(id) ON DELETE CASCADE,
