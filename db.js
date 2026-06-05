@@ -100,14 +100,22 @@ const initDB = async () => {
       ON rooms (name) WHERE type = 'public' AND name IS NOT NULL
     `);
 
-    // Seed default rooms (safe after unique index)
-    await client.query(`
-      INSERT INTO rooms (name, description) VALUES
-        ('general', 'General discussion for everyone'),
-        ('study-help', 'Ask questions and get help'),
-        ('off-topic', 'Chat about anything')
-      ON CONFLICT (name) DO NOTHING
-    `);
+    // Seed default public rooms (partial unique index — no ON CONFLICT on name alone)
+    const defaultRooms = [
+      ['general', 'General discussion for everyone'],
+      ['study-help', 'Ask questions and get help'],
+      ['off-topic', 'Chat about anything'],
+    ];
+    for (const [name, description] of defaultRooms) {
+      await client.query(
+        `INSERT INTO rooms (name, description, type)
+         SELECT $1, $2, 'public'
+         WHERE NOT EXISTS (
+           SELECT 1 FROM rooms WHERE name = $1 AND type = 'public'
+         )`,
+        [name, description]
+      );
+    }
 
     console.log('✅ Database initialized');
   } finally {
