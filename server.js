@@ -187,6 +187,47 @@ app.use(express.json());
 app.use('/api/auth', authRouter);
 app.use('/api/profile', profileRouter);
 
+function resolveUploadPath(urlPath) {
+  const uploadRoot = path.resolve(UPLOAD_DIR);
+  const diskPath = path.resolve(path.join(__dirname, urlPath.slice(1)));
+  if (!diskPath.startsWith(uploadRoot + path.sep) && diskPath !== uploadRoot) {
+    return null;
+  }
+  return diskPath;
+}
+
+function mimeFromPath(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  const map = {
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.png': 'image/png',
+    '.gif': 'image/gif',
+    '.webp': 'image/webp',
+    '.pdf': 'application/pdf',
+    '.txt': 'text/plain',
+    '.zip': 'application/zip',
+  };
+  return map[ext] || 'application/octet-stream';
+}
+
+function sendStoredFile(res, diskPath, { mime, filename, forceDownload = false }) {
+  res.type(mime || mimeFromPath(diskPath));
+  const basename = filename || path.basename(diskPath);
+  const safeName = basename.replace(/[^\w.\-() ]+/g, '_') || 'download';
+  const inline = !forceDownload && mime?.startsWith('image/');
+
+  if (inline) {
+    return res.sendFile(diskPath, {
+      headers: {
+        'Content-Disposition': `inline; filename="${safeName}"`,
+      },
+    });
+  }
+
+  return res.download(diskPath, safeName);
+}
+
 // Secure file access — only room members (or avatar owner) can view files
 app.get('/api/files', authenticate, async (req, res) => {
   try {
@@ -195,24 +236,30 @@ app.get('/api/files', authenticate, async (req, res) => {
       return res.status(400).json({ error: 'Invalid path' });
     }
 
-    const diskPath = path.join(__dirname, urlPath.slice(1));
-    if (!fs.existsSync(diskPath)) {
+    const diskPath = resolveUploadPath(urlPath);
+    if (!diskPath || !fs.existsSync(diskPath)) {
       return res.status(404).json({ error: 'File not found' });
     }
+
+    const forceDownload = req.query.download === '1' || req.query.download === 'true';
 
     if (urlPath.includes('/avatars/')) {
       const owner = await pool.query('SELECT id FROM users WHERE avatar_url = $1', [urlPath]);
       if (owner.rows[0]) {
-        return res.sendFile(diskPath);
+        return sendStoredFile(res, diskPath, { mime: mimeFromPath(diskPath), forceDownload: false });
       }
     }
 
     const msg = await pool.query(
-      'SELECT room_id FROM messages WHERE attachment_url = $1 LIMIT 1',
+      'SELECT room_id, attachment_name, attachment_mime FROM messages WHERE attachment_url = $1 LIMIT 1',
       [urlPath]
     );
     if (msg.rows[0] && (await canAccessRoom(req.user.id, msg.rows[0].room_id))) {
-      return res.sendFile(diskPath);
+      return sendStoredFile(res, diskPath, {
+        mime: msg.rows[0].attachment_mime,
+        filename: msg.rows[0].attachment_name,
+        forceDownload,
+      });
     }
 
     res.status(403).json({ error: 'Access denied' });
@@ -631,13 +678,13 @@ io.on('connection', async (socket) => {
     const prev = socket.data.presenceRoom;
     if (prev && prev !== roomId && onlineUsers.has(prev)) {
       onlineUsers.get(prev).delete(socket.user.username);
-      io.to(prev).emit('online_users', [...onlineUsers.get(prev)]);
+      io.to(prev).emit('online_users', { roomId: prev, users: [...onlineUsers.get(prev)] });
     }
 
     socket.data.presenceRoom = roomId;
     if (!onlineUsers.has(roomId)) onlineUsers.set(roomId, new Set());
     onlineUsers.get(roomId).add(socket.user.username);
-    io.to(roomId).emit('online_users', [...onlineUsers.get(roomId)]);
+    io.to(roomId).emit('online_users', { roomId, users: [...onlineUsers.get(roomId)] });
   });
 
   socket.on('send_message', async ({ roomId, content, replyToId }) => {
@@ -674,15 +721,23 @@ io.on('connection', async (socket) => {
     }
   });
 
-  socket.on('typing', ({ roomId, isTyping }) => {
-    socket.to(roomId).emit('user_typing', { username: socket.user.username, isTyping });
+  socket.on('typing', async ({ roomId, isTyping }) => {
+    if (!roomId || !(await canAccessRoom(socket.user.id, roomId))) return;
+    socket.to(roomId).emit('user_typing', {
+      username: socket.user.username,
+      isTyping,
+      roomId,
+    });
   });
 
   socket.on('disconnect', () => {
     const presenceRoom = socket.data.presenceRoom;
     if (presenceRoom && onlineUsers.has(presenceRoom)) {
       onlineUsers.get(presenceRoom).delete(socket.user.username);
-      io.to(presenceRoom).emit('online_users', [...onlineUsers.get(presenceRoom)]);
+      io.to(presenceRoom).emit('online_users', {
+        roomId: presenceRoom,
+        users: [...onlineUsers.get(presenceRoom)],
+      });
     }
     console.log(`🔌 ${socket.user.username} disconnected`);
   });
