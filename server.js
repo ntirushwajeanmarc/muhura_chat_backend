@@ -1,11 +1,52 @@
 require('dotenv').config();
 const express = require('express');
 const http = require('http');
+const path = require('path');
+const fs = require('fs');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
+const multer = require('multer');
+const { v4: uuidv4 } = require('uuid');
 const { pool, initDB } = require('./db');
 const { router: authRouter, authenticate } = require('./auth');
+
+const UPLOAD_DIR = path.join(__dirname, 'uploads');
+const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
+const ALLOWED_MIMES = new Set([
+  'image/jpeg', 'image/png', 'image/gif', 'image/webp',
+  'application/pdf',
+  'text/plain',
+  'application/msword',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/vnd.ms-excel',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/vnd.ms-powerpoint',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  'application/zip',
+]);
+
+if (!fs.existsSync(UPLOAD_DIR)) {
+  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+}
+
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: UPLOAD_DIR,
+    filename: (_req, file, cb) => {
+      const ext = path.extname(file.originalname).toLowerCase();
+      cb(null, `${uuidv4()}${ext}`);
+    },
+  }),
+  limits: { fileSize: MAX_FILE_SIZE },
+  fileFilter: (_req, file, cb) => {
+    if (ALLOWED_MIMES.has(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('File type not allowed'));
+    }
+  },
+});
 
 const app = express();
 const server = http.createServer(app);
@@ -25,11 +66,38 @@ function formatMessageRow(row) {
     username: row.username,
     avatar_color: row.avatar_color,
   };
+  if (row.attachment_url) {
+    msg.attachment = {
+      url: row.attachment_url,
+      name: row.attachment_name,
+      mime: row.attachment_mime,
+    };
+  }
   if (row.reply_to_id && row.reply_username) {
     msg.reply_to = {
       id: row.reply_to_id,
       username: row.reply_username,
       content: row.reply_content,
+    };
+  }
+  return msg;
+}
+
+function buildLiveMessage(row, socketUser, roomId, replyTo = null) {
+  const msg = {
+    id: row.id,
+    content: row.content,
+    created_at: row.created_at,
+    username: socketUser.username,
+    avatar_color: socketUser.avatar_color,
+    room_id: roomId,
+    reply_to: replyTo,
+  };
+  if (row.attachment_url) {
+    msg.attachment = {
+      url: row.attachment_url,
+      name: row.attachment_name,
+      mime: row.attachment_mime,
     };
   }
   return msg;
@@ -109,6 +177,7 @@ const io = new Server(server, {
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
 app.use(express.json());
+app.use('/uploads', express.static(UPLOAD_DIR));
 
 // Routes
 app.use('/api/auth', authRouter);
@@ -118,13 +187,35 @@ app.get('/api/users/search', authenticate, async (req, res) => {
   try {
     const q = (req.query.q || '').trim();
     if (q.length < 1) return res.json([]);
+    const pattern = `%${q}%`;
+    const prefixPattern = `${q}%`;
+    const phoneDigits = q.replace(/[^\d]/g, '');
+    const params = [req.user.id, pattern, prefixPattern];
+    let phoneClause = '';
+    if (phoneDigits.length >= 1) {
+      phoneClause = 'OR (phone IS NOT NULL AND phone ILIKE $4)';
+      params.push(`%${phoneDigits}%`);
+    }
+
     const result = await pool.query(
-      `SELECT id, username, avatar_color
-       FROM users
-       WHERE id <> $1 AND username ILIKE $2
-       ORDER BY username
+      `SELECT id, username, surname, email, phone, avatar_color
+       FROM (
+         SELECT id, username, surname, email, phone, avatar_color,
+                CASE
+                  WHEN username ILIKE $3 OR surname ILIKE $3 THEN 0
+                  WHEN username ILIKE $2 OR surname ILIKE $2 OR email ILIKE $2 THEN 1
+                  ELSE 2
+                END AS rank
+         FROM users
+         WHERE id <> $1 AND (
+           username ILIKE $2 OR surname ILIKE $2 OR email ILIKE $2
+           OR (phone IS NOT NULL AND phone ILIKE $2)
+           ${phoneClause}
+         )
+       ) matched
+       ORDER BY rank, username
        LIMIT 20`,
-      [req.user.id, `%${q}%`]
+      params
     );
     res.json(result.rows);
   } catch (err) {
@@ -319,6 +410,7 @@ const MESSAGE_PAGE_MAX = 100;
 
 const MESSAGE_SELECT = `
   SELECT m.id, m.content, m.created_at, m.reply_to_id,
+         m.attachment_url, m.attachment_name, m.attachment_mime,
          u.username, u.avatar_color,
          ru.username AS reply_username,
          rm.content AS reply_content
@@ -327,6 +419,72 @@ const MESSAGE_SELECT = `
   LEFT JOIN messages rm ON m.reply_to_id = rm.id
   LEFT JOIN users ru ON rm.user_id = ru.id
 `;
+
+// Upload a file and post it as a message
+app.post('/api/rooms/:roomId/upload', authenticate, (req, res) => {
+  upload.single('file')(req, res, async (err) => {
+    if (err) {
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        return res.status(400).json({ error: 'File too large (max 10 MB)' });
+      }
+      return res.status(400).json({ error: err.message || 'Upload failed' });
+    }
+    if (!req.file) return res.status(400).json({ error: 'No file provided' });
+
+    const roomId = req.params.roomId;
+    if (!(await canAccessRoom(req.user.id, roomId))) {
+      fs.unlink(req.file.path, () => {});
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    try {
+      const caption = (req.body.content || '').trim();
+      const replyToId = req.body.replyToId || null;
+      let replyTo = null;
+
+      if (replyToId) {
+        const replyRow = await pool.query(
+          `SELECT m.id, m.content, m.room_id, u.username
+           FROM messages m JOIN users u ON m.user_id = u.id
+           WHERE m.id = $1`,
+          [replyToId]
+        );
+        if (replyRow.rows[0]?.room_id === roomId) {
+          replyTo = {
+            id: replyRow.rows[0].id,
+            username: replyRow.rows[0].username,
+            content: replyRow.rows[0].content,
+          };
+        }
+      }
+
+      const attachmentUrl = `/uploads/${req.file.filename}`;
+      const result = await pool.query(
+        `INSERT INTO messages (room_id, user_id, content, reply_to_id, attachment_url, attachment_name, attachment_mime)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         RETURNING id, content, created_at, attachment_url, attachment_name, attachment_mime`,
+        [
+          roomId,
+          req.user.id,
+          caption,
+          replyTo?.id || null,
+          attachmentUrl,
+          req.file.originalname,
+          req.file.mimetype,
+        ]
+      );
+
+      const row = result.rows[0];
+      const msg = buildLiveMessage(row, req.user, roomId, replyTo);
+      io.to(roomId).emit('new_message', msg);
+      res.json({ message: formatMessageRow({ ...row, username: req.user.username, avatar_color: req.user.avatar_color, reply_to_id: replyTo?.id, reply_username: replyTo?.username, reply_content: replyTo?.content }) });
+    } catch (uploadErr) {
+      fs.unlink(req.file.path, () => {});
+      console.error('Upload error:', uploadErr);
+      res.status(500).json({ error: 'Server error' });
+    }
+  });
+});
 
 // Paginated messages: ?limit=50&before=<messageId> loads older history
 app.get('/api/rooms/:roomId/messages', authenticate, async (req, res) => {
@@ -430,18 +588,12 @@ io.on('connection', (socket) => {
       }
 
       const result = await pool.query(
-        'INSERT INTO messages (room_id, user_id, content, reply_to_id) VALUES ($1, $2, $3, $4) RETURNING id, created_at',
+        `INSERT INTO messages (room_id, user_id, content, reply_to_id)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id, content, created_at, attachment_url, attachment_name, attachment_mime`,
         [roomId, socket.user.id, content.trim(), replyTo?.id || null]
       );
-      const msg = {
-        id: result.rows[0].id,
-        content: content.trim(),
-        created_at: result.rows[0].created_at,
-        username: socket.user.username,
-        avatar_color: socket.user.avatar_color,
-        room_id: roomId,
-        reply_to: replyTo,
-      };
+      const msg = buildLiveMessage(result.rows[0], socket.user, roomId, replyTo);
       io.to(roomId).emit('new_message', msg);
     } catch (err) {
       console.error('Message error:', err);

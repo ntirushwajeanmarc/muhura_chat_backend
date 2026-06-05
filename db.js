@@ -12,11 +12,16 @@ const initDB = async () => {
       CREATE TABLE IF NOT EXISTS users (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         username VARCHAR(50) UNIQUE NOT NULL,
+        surname VARCHAR(50),
         email VARCHAR(100) UNIQUE NOT NULL,
+        phone VARCHAR(20),
         password_hash VARCHAR(255) NOT NULL,
         avatar_color VARCHAR(7) DEFAULT '#6366f1',
         created_at TIMESTAMPTZ DEFAULT NOW()
       );
+
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR(20);
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS surname VARCHAR(50);
 
       CREATE TABLE IF NOT EXISTS rooms (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -48,6 +53,9 @@ const initDB = async () => {
       );
 
       ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to_id UUID REFERENCES messages(id) ON DELETE SET NULL;
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS attachment_url VARCHAR(500);
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS attachment_name VARCHAR(255);
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS attachment_mime VARCHAR(100);
 
       CREATE INDEX IF NOT EXISTS idx_messages_room_created ON messages(room_id, created_at DESC);
     `);
@@ -77,6 +85,11 @@ const initDB = async () => {
         ORDER BY name, created_at ASC
       ) k
       WHERE r.name = k.name AND r.id <> k.keep_id
+    `);
+
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone_unique
+      ON users (phone) WHERE phone IS NOT NULL AND phone <> ''
     `);
 
     await client.query(`UPDATE rooms SET type = 'public' WHERE type IS NULL`);
