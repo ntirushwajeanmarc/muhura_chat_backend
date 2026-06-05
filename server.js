@@ -56,6 +56,7 @@ const server = http.createServer(app);
 const defaultOrigins = [
   'https://muhura-chat-frontend.onrender.com',
   'https://www.muhura-chat-frontend.onrender.com',
+  'https://eganira.circuitnotion.com',
   'http://localhost:5173',
   'http://127.0.0.1:5173',
 ];
@@ -160,9 +161,11 @@ async function formatRoomRow(row, currentUserId) {
   return room;
 }
 
-const allowedOrigins = process.env.CLIENT_URL
+const envOrigins = process.env.CLIENT_URL
   ? process.env.CLIENT_URL.split(',').map((o) => o.trim()).filter(Boolean)
-  : defaultOrigins;
+  : [];
+
+const allowedOrigins = [...new Set([...defaultOrigins, ...envOrigins])];
 
 const corsOptions = {
   origin: (origin, callback) => {
