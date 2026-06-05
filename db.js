@@ -76,6 +76,24 @@ const initDB = async () => {
         updated_at TIMESTAMPTZ DEFAULT NOW(),
         PRIMARY KEY (room_id, user_id)
       );
+
+      CREATE TABLE IF NOT EXISTS profile_likes (
+        liker_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        liked_user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        PRIMARY KEY (liker_id, liked_user_id),
+        CHECK (liker_id <> liked_user_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS message_likes (
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        message_id UUID REFERENCES messages(id) ON DELETE CASCADE,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        PRIMARY KEY (user_id, message_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_message_likes_message ON message_likes(message_id);
+      CREATE INDEX IF NOT EXISTS idx_profile_likes_user ON profile_likes(liked_user_id);
     `);
 
     // Merge duplicate rooms (keeps oldest per name, moves messages to kept room)

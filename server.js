@@ -65,6 +65,7 @@ function formatMessageRow(row) {
     id: row.id,
     content: row.content,
     created_at: row.created_at,
+    user_id: row.user_id,
     username: row.username,
     avatar_color: row.avatar_color,
     avatar_url: row.avatar_url || null,
@@ -84,6 +85,12 @@ function formatMessageRow(row) {
       content: row.reply_content,
     };
   }
+  if (row.like_count !== undefined && row.like_count !== null) {
+    msg.likes = {
+      count: parseInt(row.like_count, 10) || 0,
+      liked_by_me: !!row.liked_by_me,
+    };
+  }
   return msg;
 }
 
@@ -92,6 +99,7 @@ function buildLiveMessage(row, socketUser, roomId, replyTo = null) {
     id: row.id,
     content: row.content,
     created_at: row.created_at,
+    user_id: socketUser.id,
     username: socketUser.username,
     avatar_color: socketUser.avatar_color,
     avatar_url: socketUser.avatar_url || null,
@@ -105,6 +113,7 @@ function buildLiveMessage(row, socketUser, roomId, replyTo = null) {
       mime: row.attachment_mime,
     };
   }
+  msg.likes = { count: 0, liked_by_me: false };
   return msg;
 }
 
@@ -573,17 +582,24 @@ app.post('/api/chats/groups', authenticate, async (req, res) => {
 const MESSAGE_PAGE_SIZE = 50;
 const MESSAGE_PAGE_MAX = 100;
 
-const MESSAGE_SELECT = `
+function messageSelectSql(viewerIdParam) {
+  return `
   SELECT m.id, m.content, m.created_at, m.edited_at, m.reply_to_id,
          m.attachment_url, m.attachment_name, m.attachment_mime,
-         u.username, u.avatar_color, u.avatar_url,
+         u.id AS user_id, u.username, u.avatar_color, u.avatar_url,
          ru.username AS reply_username,
-         rm.content AS reply_content
+         rm.content AS reply_content,
+         (SELECT COUNT(*)::int FROM message_likes ml WHERE ml.message_id = m.id) AS like_count,
+         EXISTS(
+           SELECT 1 FROM message_likes ml2
+           WHERE ml2.message_id = m.id AND ml2.user_id = $${viewerIdParam}
+         ) AS liked_by_me
   FROM messages m
   JOIN users u ON m.user_id = u.id
   LEFT JOIN messages rm ON m.reply_to_id = rm.id
   LEFT JOIN users ru ON rm.user_id = ru.id
 `;
+}
 
 // Upload a file and post it as a message
 app.post('/api/rooms/:roomId/upload', authenticate, (req, res) => {
@@ -681,22 +697,22 @@ app.get('/api/rooms/:roomId/messages', authenticate, async (req, res) => {
     let result;
     if (beforeId) {
       result = await pool.query(
-        `${MESSAGE_SELECT}
+        `${messageSelectSql(4)}
          WHERE m.room_id = $1
            AND m.created_at < (
              SELECT created_at FROM messages WHERE id = $2 AND room_id = $1
            )
          ORDER BY m.created_at DESC
          LIMIT $3`,
-        [roomId, beforeId, limit]
+        [roomId, beforeId, limit, req.user.id]
       );
     } else {
       result = await pool.query(
-        `${MESSAGE_SELECT}
+        `${messageSelectSql(3)}
          WHERE m.room_id = $1
          ORDER BY m.created_at DESC
          LIMIT $2`,
-        [roomId, limit]
+        [roomId, limit, req.user.id]
       );
     }
 
@@ -827,11 +843,62 @@ async function updateMessageContent(userId, roomId, messageId, content) {
     [trimmed, messageId]
   );
 
-  const full = await pool.query(`${MESSAGE_SELECT} WHERE m.id = $1`, [messageId]);
+  const full = await pool.query(`${messageSelectSql(2)} WHERE m.id = $1`, [messageId, userId]);
   const msg = formatMessageRow(full.rows[0]);
   msg.room_id = roomId;
   return { message: msg };
 }
+
+app.post('/api/messages/:messageId/like', authenticate, async (req, res) => {
+  try {
+    const { messageId } = req.params;
+    const msgRow = await pool.query('SELECT room_id FROM messages WHERE id = $1', [messageId]);
+    if (!msgRow.rows[0]) return res.status(404).json({ error: 'Message not found' });
+
+    const roomId = msgRow.rows[0].room_id;
+    if (!(await canAccessRoom(req.user.id, roomId))) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const existing = await pool.query(
+      'SELECT 1 FROM message_likes WHERE user_id = $1 AND message_id = $2',
+      [req.user.id, messageId]
+    );
+
+    let liked;
+    if (existing.rows.length > 0) {
+      await pool.query(
+        'DELETE FROM message_likes WHERE user_id = $1 AND message_id = $2',
+        [req.user.id, messageId]
+      );
+      liked = false;
+    } else {
+      await pool.query(
+        'INSERT INTO message_likes (user_id, message_id) VALUES ($1, $2)',
+        [req.user.id, messageId]
+      );
+      liked = true;
+    }
+
+    const countRes = await pool.query(
+      'SELECT COUNT(*)::int AS count FROM message_likes WHERE message_id = $1',
+      [messageId]
+    );
+    const like_count = countRes.rows[0].count;
+    const payload = {
+      message_id: messageId,
+      room_id: roomId,
+      like_count,
+      user_id: req.user.id,
+      liked,
+    };
+    io.to(roomId).emit('message_like_updated', payload);
+    res.json({ liked, like_count });
+  } catch (err) {
+    console.error('Message like error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
 
 app.patch('/api/rooms/:roomId/messages/:messageId', authenticate, async (req, res) => {
   try {
