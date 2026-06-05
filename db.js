@@ -20,11 +20,23 @@ const initDB = async () => {
 
       CREATE TABLE IF NOT EXISTS rooms (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        name VARCHAR(100) NOT NULL,
+        name VARCHAR(100),
         description VARCHAR(255),
+        type VARCHAR(20) DEFAULT 'public',
         created_by UUID REFERENCES users(id),
         created_at TIMESTAMPTZ DEFAULT NOW()
       );
+
+      ALTER TABLE rooms ADD COLUMN IF NOT EXISTS type VARCHAR(20) DEFAULT 'public';
+
+      CREATE TABLE IF NOT EXISTS room_members (
+        room_id UUID REFERENCES rooms(id) ON DELETE CASCADE,
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        joined_at TIMESTAMPTZ DEFAULT NOW(),
+        PRIMARY KEY (room_id, user_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_room_members_user ON room_members(user_id);
 
       CREATE TABLE IF NOT EXISTS messages (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -67,8 +79,12 @@ const initDB = async () => {
       WHERE r.name = k.name AND r.id <> k.keep_id
     `);
 
+    await client.query(`UPDATE rooms SET type = 'public' WHERE type IS NULL`);
+
+    await client.query(`DROP INDEX IF EXISTS idx_rooms_name_unique`);
     await client.query(`
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_rooms_name_unique ON rooms (name)
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_rooms_public_name
+      ON rooms (name) WHERE type = 'public' AND name IS NOT NULL
     `);
 
     // Seed default rooms (safe after unique index)

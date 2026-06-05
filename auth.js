@@ -21,7 +21,11 @@ router.post('/register', async (req, res) => {
       [username, email, hash, color]
     );
     const user = result.rows[0];
-    const token = jwt.sign({ id: user.id, username: user.username }, process.env.JWT_SECRET, { expiresIn: '7d' });
+    const token = jwt.sign(
+      { id: user.id, username: user.username, avatar_color: user.avatar_color },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' }
+    );
     res.json({ token, user });
   } catch (err) {
     if (err.code === '23505') return res.status(409).json({ error: 'Username or email already taken' });
@@ -42,7 +46,11 @@ router.post('/login', async (req, res) => {
     const valid = await bcrypt.compare(password, user.password_hash);
     if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
 
-    const token = jwt.sign({ id: user.id, username: user.username }, process.env.JWT_SECRET, { expiresIn: '7d' });
+    const token = jwt.sign(
+      { id: user.id, username: user.username, avatar_color: user.avatar_color },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' }
+    );
     res.json({ token, user: { id: user.id, username: user.username, email: user.email, avatar_color: user.avatar_color } });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });

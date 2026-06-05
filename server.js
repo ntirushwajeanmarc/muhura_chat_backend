@@ -35,6 +35,48 @@ function formatMessageRow(row) {
   return msg;
 }
 
+async function canAccessRoom(userId, roomId) {
+  const result = await pool.query(
+    `SELECT r.type FROM rooms r WHERE r.id = $1`,
+    [roomId]
+  );
+  const room = result.rows[0];
+  if (!room) return false;
+  if (room.type === 'public') return true;
+  const member = await pool.query(
+    `SELECT 1 FROM room_members WHERE room_id = $1 AND user_id = $2`,
+    [roomId, userId]
+  );
+  return member.rows.length > 0;
+}
+
+async function formatRoomRow(row, currentUserId) {
+  const room = {
+    id: row.id,
+    name: row.name,
+    description: row.description,
+    type: row.type,
+    created_by: row.created_by,
+    created_at: row.created_at,
+  };
+  if (row.type === 'direct' && row.peer_id) {
+    room.peer = {
+      id: row.peer_id,
+      username: row.peer_username,
+      avatar_color: row.peer_avatar_color,
+    };
+    room.display_name = row.peer_username;
+  } else if (row.type === 'group') {
+    room.display_name = row.name;
+    if (row.member_count) room.member_count = parseInt(row.member_count, 10);
+  } else {
+    room.display_name = row.name;
+  }
+  if (row.last_message) room.last_message = row.last_message;
+  if (row.last_message_at) room.last_message_at = row.last_message_at;
+  return room;
+}
+
 const allowedOrigins = process.env.CLIENT_URL
   ? process.env.CLIENT_URL.split(',').map((o) => o.trim()).filter(Boolean)
   : defaultOrigins;
@@ -57,7 +99,7 @@ const corsOptions = {
 };
 
 const io = new Server(server, {
-  cors: { 
+  cors: {
     origin: allowedOrigins,
     methods: ['GET', 'POST'],
     credentials: true,
@@ -71,16 +113,203 @@ app.use(express.json());
 // Routes
 app.use('/api/auth', authRouter);
 
-// Get all rooms
-app.get('/api/rooms', authenticate, async (req, res) => {
+// Search users (for starting DMs or adding to groups)
+app.get('/api/users/search', authenticate, async (req, res) => {
   try {
+    const q = (req.query.q || '').trim();
+    if (q.length < 1) return res.json([]);
     const result = await pool.query(
-      `SELECT DISTINCT ON (name) id, name, description, created_by, created_at
-       FROM rooms
-       ORDER BY name, created_at ASC`
+      `SELECT id, username, avatar_color
+       FROM users
+       WHERE id <> $1 AND username ILIKE $2
+       ORDER BY username
+       LIMIT 20`,
+      [req.user.id, `%${q}%`]
     );
     res.json(result.rows);
   } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Public channels (global rooms)
+app.get('/api/rooms', authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT DISTINCT ON (name) id, name, description, type, created_by, created_at
+       FROM rooms
+       WHERE type = 'public'
+       ORDER BY name, created_at ASC`
+    );
+    const rooms = result.rows.map((r) => ({
+      ...r,
+      type: 'public',
+      display_name: r.name,
+    }));
+    res.json(rooms);
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// User's private chats and groups
+app.get('/api/chats', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const directResult = await pool.query(
+      `SELECT r.id, r.name, r.description, r.type, r.created_by, r.created_at,
+              u.id AS peer_id, u.username AS peer_username, u.avatar_color AS peer_avatar_color,
+              lm.content AS last_message, lm.created_at AS last_message_at
+       FROM rooms r
+       JOIN room_members rm ON r.id = rm.room_id AND rm.user_id = $1
+       JOIN room_members rm2 ON r.id = rm2.room_id AND rm2.user_id <> $1
+       JOIN users u ON u.id = rm2.user_id
+       LEFT JOIN LATERAL (
+         SELECT content, created_at FROM messages
+         WHERE room_id = r.id ORDER BY created_at DESC LIMIT 1
+       ) lm ON true
+       WHERE r.type = 'direct'
+       ORDER BY COALESCE(lm.created_at, r.created_at) DESC`,
+      [userId]
+    );
+
+    const groupResult = await pool.query(
+      `SELECT r.id, r.name, r.description, r.type, r.created_by, r.created_at,
+              (SELECT COUNT(*) FROM room_members WHERE room_id = r.id) AS member_count,
+              lm.content AS last_message, lm.created_at AS last_message_at
+       FROM rooms r
+       JOIN room_members rm ON r.id = rm.room_id AND rm.user_id = $1
+       LEFT JOIN LATERAL (
+         SELECT content, created_at FROM messages
+         WHERE room_id = r.id ORDER BY created_at DESC LIMIT 1
+       ) lm ON true
+       WHERE r.type = 'group'
+       ORDER BY COALESCE(lm.created_at, r.created_at) DESC`,
+      [userId]
+    );
+
+    const direct = await Promise.all(
+      directResult.rows.map((row) => formatRoomRow(row, userId))
+    );
+    const groups = await Promise.all(
+      groupResult.rows.map((row) => formatRoomRow(row, userId))
+    );
+
+    res.json({ direct, groups });
+  } catch (err) {
+    console.error('Chats error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Start or open a direct chat
+app.post('/api/chats/direct', authenticate, async (req, res) => {
+  try {
+    const { userId: peerId } = req.body;
+    const userId = req.user.id;
+    if (!peerId) return res.status(400).json({ error: 'userId required' });
+    if (peerId === userId) return res.status(400).json({ error: 'Cannot chat with yourself' });
+
+    const peerCheck = await pool.query(
+      'SELECT id, username, avatar_color FROM users WHERE id = $1',
+      [peerId]
+    );
+    if (!peerCheck.rows[0]) return res.status(404).json({ error: 'User not found' });
+
+    const existing = await pool.query(
+      `SELECT r.id FROM rooms r
+       JOIN room_members rm1 ON r.id = rm1.room_id AND rm1.user_id = $1
+       JOIN room_members rm2 ON r.id = rm2.room_id AND rm2.user_id = $2
+       WHERE r.type = 'direct'
+       LIMIT 1`,
+      [userId, peerId]
+    );
+
+    let roomId;
+    if (existing.rows[0]) {
+      roomId = existing.rows[0].id;
+    } else {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const room = await client.query(
+          `INSERT INTO rooms (type, created_by) VALUES ('direct', $1) RETURNING id`,
+          [userId]
+        );
+        roomId = room.rows[0].id;
+        await client.query(
+          `INSERT INTO room_members (room_id, user_id) VALUES ($1, $2), ($1, $3)`,
+          [roomId, userId, peerId]
+        );
+        await client.query('COMMIT');
+      } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+      } finally {
+        client.release();
+      }
+    }
+
+    const peer = peerCheck.rows[0];
+    res.json({
+      id: roomId,
+      type: 'direct',
+      display_name: peer.username,
+      peer: {
+        id: peer.id,
+        username: peer.username,
+        avatar_color: peer.avatar_color,
+      },
+    });
+  } catch (err) {
+    console.error('Direct chat error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Create a group chat
+app.post('/api/chats/groups', authenticate, async (req, res) => {
+  try {
+    const { name, memberIds = [] } = req.body;
+    const userId = req.user.id;
+    const groupName = (name || '').trim();
+    if (!groupName) return res.status(400).json({ error: 'Group name required' });
+
+    const uniqueMembers = [...new Set(memberIds.filter((id) => id && id !== userId))];
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const room = await client.query(
+        `INSERT INTO rooms (name, type, created_by) VALUES ($1, 'group', $2) RETURNING id, name, type, created_at`,
+        [groupName, userId]
+      );
+      const roomId = room.rows[0].id;
+      const allMembers = [userId, ...uniqueMembers];
+      for (const memberId of allMembers) {
+        await client.query(
+          `INSERT INTO room_members (room_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+          [roomId, memberId]
+        );
+      }
+      await client.query('COMMIT');
+
+      res.json({
+        id: roomId,
+        name: groupName,
+        type: 'group',
+        display_name: groupName,
+        member_count: allMembers.length,
+        created_at: room.rows[0].created_at,
+      });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    console.error('Group chat error:', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -103,6 +332,10 @@ const MESSAGE_SELECT = `
 app.get('/api/rooms/:roomId/messages', authenticate, async (req, res) => {
   try {
     const roomId = req.params.roomId;
+    if (!(await canAccessRoom(req.user.id, roomId))) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
     const limit = Math.min(
       Math.max(parseInt(req.query.limit, 10) || MESSAGE_PAGE_SIZE, 1),
       MESSAGE_PAGE_MAX
@@ -156,8 +389,9 @@ const onlineUsers = new Map(); // roomId -> Set of usernames
 io.on('connection', (socket) => {
   console.log(`🔌 ${socket.user.username} connected`);
 
-  socket.on('join_room', (roomId) => {
-    // Leave old rooms
+  socket.on('join_room', async (roomId) => {
+    if (!(await canAccessRoom(socket.user.id, roomId))) return;
+
     socket.rooms.forEach(r => {
       if (r !== socket.id) {
         socket.leave(r);
@@ -176,6 +410,7 @@ io.on('connection', (socket) => {
 
   socket.on('send_message', async ({ roomId, content, replyToId }) => {
     if (!content?.trim()) return;
+    if (!(await canAccessRoom(socket.user.id, roomId))) return;
     try {
       let replyTo = null;
       if (replyToId) {
