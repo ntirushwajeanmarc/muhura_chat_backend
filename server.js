@@ -68,6 +68,7 @@ function formatMessageRow(row) {
     avatar_color: row.avatar_color,
     avatar_url: row.avatar_url || null,
   };
+  if (row.edited_at) msg.edited_at = row.edited_at;
   if (row.attachment_url) {
     msg.attachment = {
       url: row.attachment_url,
@@ -501,7 +502,7 @@ const MESSAGE_PAGE_SIZE = 50;
 const MESSAGE_PAGE_MAX = 100;
 
 const MESSAGE_SELECT = `
-  SELECT m.id, m.content, m.created_at, m.reply_to_id,
+  SELECT m.id, m.content, m.created_at, m.edited_at, m.reply_to_id,
          m.attachment_url, m.attachment_name, m.attachment_mime,
          u.username, u.avatar_color, u.avatar_url,
          ru.username AS reply_username,
@@ -621,6 +622,146 @@ app.get('/api/rooms/:roomId/messages', authenticate, async (req, res) => {
   }
 });
 
+async function getMessageCreatedAt(messageId, roomId) {
+  const result = await pool.query(
+    'SELECT created_at FROM messages WHERE id = $1 AND room_id = $2',
+    [messageId, roomId]
+  );
+  return result.rows[0]?.created_at || null;
+}
+
+async function markRoomRead(userId, roomId, messageId) {
+  if (!(await canAccessRoom(userId, roomId))) {
+    return { error: 'Access denied', status: 403 };
+  }
+
+  const messageAt = await getMessageCreatedAt(messageId, roomId);
+  if (!messageAt) return { error: 'Message not found', status: 404 };
+
+  const current = await pool.query(
+    `SELECT rrs.last_read_message_id, m.created_at AS last_read_at
+     FROM room_read_state rrs
+     LEFT JOIN messages m ON m.id = rrs.last_read_message_id
+     WHERE rrs.room_id = $1 AND rrs.user_id = $2`,
+    [roomId, userId]
+  );
+
+  const prevAt = current.rows[0]?.last_read_at;
+  if (prevAt && new Date(messageAt) <= new Date(prevAt)) {
+    const existing = await pool.query(
+      `SELECT rrs.user_id, u.username, rrs.last_read_message_id, m.created_at AS last_read_at
+       FROM room_read_state rrs
+       JOIN users u ON u.id = rrs.user_id
+       LEFT JOIN messages m ON m.id = rrs.last_read_message_id
+       WHERE rrs.room_id = $1 AND rrs.user_id = $2`,
+      [roomId, userId]
+    );
+    const row = existing.rows[0];
+    return {
+      receipt: {
+        room_id: roomId,
+        user_id: row.user_id,
+        username: row.username,
+        last_read_message_id: row.last_read_message_id,
+        last_read_at: row.last_read_at,
+      },
+    };
+  }
+
+  await pool.query(
+    `INSERT INTO room_read_state (room_id, user_id, last_read_message_id, updated_at)
+     VALUES ($1, $2, $3, NOW())
+     ON CONFLICT (room_id, user_id)
+     DO UPDATE SET last_read_message_id = $3, updated_at = NOW()`,
+    [roomId, userId, messageId]
+  );
+
+  const userRow = await pool.query('SELECT username FROM users WHERE id = $1', [userId]);
+  return {
+    receipt: {
+      room_id: roomId,
+      user_id: userId,
+      username: userRow.rows[0]?.username,
+      last_read_message_id: messageId,
+      last_read_at: messageAt,
+    },
+  };
+}
+
+app.get('/api/rooms/:roomId/read-state', authenticate, async (req, res) => {
+  try {
+    const roomId = req.params.roomId;
+    if (!(await canAccessRoom(req.user.id, roomId))) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const result = await pool.query(
+      `SELECT rrs.user_id, u.username, rrs.last_read_message_id, m.created_at AS last_read_at
+       FROM room_read_state rrs
+       JOIN users u ON u.id = rrs.user_id
+       LEFT JOIN messages m ON m.id = rrs.last_read_message_id
+       WHERE rrs.room_id = $1`,
+      [roomId]
+    );
+
+    res.json({
+      reads: result.rows.map((row) => ({
+        user_id: row.user_id,
+        username: row.username,
+        last_read_message_id: row.last_read_message_id,
+        last_read_at: row.last_read_at,
+      })),
+    });
+  } catch (err) {
+    console.error('Read state error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+async function updateMessageContent(userId, roomId, messageId, content) {
+  if (!(await canAccessRoom(userId, roomId))) {
+    return { error: 'Access denied', status: 403 };
+  }
+
+  const existing = await pool.query(
+    `SELECT m.id, m.user_id, m.attachment_url
+     FROM messages m WHERE m.id = $1 AND m.room_id = $2`,
+    [messageId, roomId]
+  );
+  const row = existing.rows[0];
+  if (!row) return { error: 'Message not found', status: 404 };
+  if (row.user_id !== userId) return { error: 'You can only edit your own messages', status: 403 };
+
+  const trimmed = (content || '').trim();
+  if (!trimmed && !row.attachment_url) {
+    return { error: 'Message cannot be empty', status: 400 };
+  }
+
+  await pool.query(
+    `UPDATE messages SET content = $1, edited_at = NOW() WHERE id = $2`,
+    [trimmed, messageId]
+  );
+
+  const full = await pool.query(`${MESSAGE_SELECT} WHERE m.id = $1`, [messageId]);
+  const msg = formatMessageRow(full.rows[0]);
+  msg.room_id = roomId;
+  return { message: msg };
+}
+
+app.patch('/api/rooms/:roomId/messages/:messageId', authenticate, async (req, res) => {
+  try {
+    const { roomId, messageId } = req.params;
+    const result = await updateMessageContent(req.user.id, roomId, messageId, req.body.content);
+    if (result.error) return res.status(result.status).json({ error: result.error });
+
+    io.to(roomId).emit('message_edited', result.message);
+    res.json({ message: result.message });
+  } catch (err) {
+    console.error('Edit message error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // Socket.IO auth middleware
 io.use((socket, next) => {
   const token = socket.handshake.auth?.token;
@@ -718,6 +859,28 @@ io.on('connection', async (socket) => {
       io.to(roomId).emit('new_message', msg);
     } catch (err) {
       console.error('Message error:', err);
+    }
+  });
+
+  socket.on('mark_read', async ({ roomId, messageId }) => {
+    if (!roomId || !messageId) return;
+    try {
+      const result = await markRoomRead(socket.user.id, roomId, messageId);
+      if (result.error || !result.receipt) return;
+      io.to(roomId).emit('read_receipt', result.receipt);
+    } catch (err) {
+      console.error('Mark read error:', err);
+    }
+  });
+
+  socket.on('edit_message', async ({ roomId, messageId, content }) => {
+    if (!roomId || !messageId) return;
+    try {
+      const result = await updateMessageContent(socket.user.id, roomId, messageId, content);
+      if (result.error) return;
+      io.to(roomId).emit('message_edited', result.message);
+    } catch (err) {
+      console.error('Edit message error:', err);
     }
   });
 

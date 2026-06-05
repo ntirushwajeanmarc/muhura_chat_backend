@@ -61,8 +61,17 @@ const initDB = async () => {
       ALTER TABLE messages ADD COLUMN IF NOT EXISTS attachment_url VARCHAR(500);
       ALTER TABLE messages ADD COLUMN IF NOT EXISTS attachment_name VARCHAR(255);
       ALTER TABLE messages ADD COLUMN IF NOT EXISTS attachment_mime VARCHAR(100);
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ;
 
       CREATE INDEX IF NOT EXISTS idx_messages_room_created ON messages(room_id, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS room_read_state (
+        room_id UUID REFERENCES rooms(id) ON DELETE CASCADE,
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        last_read_message_id UUID REFERENCES messages(id) ON DELETE SET NULL,
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        PRIMARY KEY (room_id, user_id)
+      );
     `);
 
     // Merge duplicate rooms (keeps oldest per name, moves messages to kept room)
