@@ -23,8 +23,23 @@ function formatUser(row) {
     surname: row.surname || null,
     email: row.email,
     phone: row.phone || null,
+    bio: row.bio || null,
     avatar_color: row.avatar_color,
+    avatar_url: row.avatar_url || null,
   };
+}
+
+function issueToken(user) {
+  return jwt.sign(
+    {
+      id: user.id,
+      username: user.username,
+      avatar_color: user.avatar_color,
+      avatar_url: user.avatar_url || null,
+    },
+    process.env.JWT_SECRET,
+    { expiresIn: '7d' }
+  );
 }
 
 // Register
@@ -43,15 +58,11 @@ router.post('/register', async (req, res) => {
     const hash = await bcrypt.hash(password, 10);
     const color = COLORS[Math.floor(Math.random() * COLORS.length)];
     const result = await pool.query(
-      'INSERT INTO users (username, surname, email, phone, password_hash, avatar_color) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, username, surname, email, phone, avatar_color',
+      'INSERT INTO users (username, surname, email, phone, password_hash, avatar_color) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, username, surname, email, phone, bio, avatar_color, avatar_url',
       [username, normalizedSurname, email, normalizedPhone, hash, color]
     );
     const user = formatUser(result.rows[0]);
-    const token = jwt.sign(
-      { id: user.id, username: user.username, avatar_color: user.avatar_color },
-      process.env.JWT_SECRET,
-      { expiresIn: '7d' }
-    );
+    const token = issueToken(user);
     res.json({ token, user });
   } catch (err) {
     if (err.code === '23505') {
@@ -77,11 +88,7 @@ router.post('/login', async (req, res) => {
     const valid = await bcrypt.compare(password, user.password_hash);
     if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
 
-    const token = jwt.sign(
-      { id: user.id, username: user.username, avatar_color: user.avatar_color },
-      process.env.JWT_SECRET,
-      { expiresIn: '7d' }
-    );
+    const token = issueToken(formatUser(user));
     res.json({ token, user: formatUser(user) });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });

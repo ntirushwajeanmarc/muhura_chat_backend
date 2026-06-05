@@ -10,6 +10,7 @@ const multer = require('multer');
 const { v4: uuidv4 } = require('uuid');
 const { pool, initDB } = require('./db');
 const { router: authRouter, authenticate } = require('./auth');
+const { router: profileRouter } = require('./profile');
 
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
@@ -65,6 +66,7 @@ function formatMessageRow(row) {
     created_at: row.created_at,
     username: row.username,
     avatar_color: row.avatar_color,
+    avatar_url: row.avatar_url || null,
   };
   if (row.attachment_url) {
     msg.attachment = {
@@ -90,6 +92,7 @@ function buildLiveMessage(row, socketUser, roomId, replyTo = null) {
     created_at: row.created_at,
     username: socketUser.username,
     avatar_color: socketUser.avatar_color,
+    avatar_url: socketUser.avatar_url || null,
     room_id: roomId,
     reply_to: replyTo,
   };
@@ -132,6 +135,7 @@ async function formatRoomRow(row, currentUserId) {
       id: row.peer_id,
       username: row.peer_username,
       avatar_color: row.peer_avatar_color,
+      avatar_url: row.peer_avatar_url || null,
     };
     room.display_name = row.peer_username;
   } else if (row.type === 'group') {
@@ -181,6 +185,7 @@ app.use('/uploads', express.static(UPLOAD_DIR));
 
 // Routes
 app.use('/api/auth', authRouter);
+app.use('/api/profile', profileRouter);
 
 // Search users (for starting DMs or adding to groups)
 app.get('/api/users/search', authenticate, async (req, res) => {
@@ -198,9 +203,9 @@ app.get('/api/users/search', authenticate, async (req, res) => {
     }
 
     const result = await pool.query(
-      `SELECT id, username, surname, email, phone, avatar_color
+      `SELECT id, username, surname, email, phone, avatar_color, avatar_url
        FROM (
-         SELECT id, username, surname, email, phone, avatar_color,
+         SELECT id, username, surname, email, phone, avatar_color, avatar_url,
                 CASE
                   WHEN username ILIKE $3 OR surname ILIKE $3 THEN 0
                   WHEN username ILIKE $2 OR surname ILIKE $2 OR email ILIKE $2 THEN 1
@@ -251,6 +256,7 @@ app.get('/api/chats', authenticate, async (req, res) => {
     const directResult = await pool.query(
       `SELECT r.id, r.name, r.description, r.type, r.created_by, r.created_at,
               u.id AS peer_id, u.username AS peer_username, u.avatar_color AS peer_avatar_color,
+              u.avatar_url AS peer_avatar_url,
               lm.content AS last_message, lm.created_at AS last_message_at
        FROM rooms r
        JOIN room_members rm ON r.id = rm.room_id AND rm.user_id = $1
@@ -303,7 +309,7 @@ app.post('/api/chats/direct', authenticate, async (req, res) => {
     if (peerId === userId) return res.status(400).json({ error: 'Cannot chat with yourself' });
 
     const peerCheck = await pool.query(
-      'SELECT id, username, avatar_color FROM users WHERE id = $1',
+      'SELECT id, username, avatar_color, avatar_url FROM users WHERE id = $1',
       [peerId]
     );
     if (!peerCheck.rows[0]) return res.status(404).json({ error: 'User not found' });
@@ -352,6 +358,7 @@ app.post('/api/chats/direct', authenticate, async (req, res) => {
         id: peer.id,
         username: peer.username,
         avatar_color: peer.avatar_color,
+        avatar_url: peer.avatar_url || null,
       },
     });
   } catch (err) {
@@ -412,7 +419,7 @@ const MESSAGE_PAGE_MAX = 100;
 const MESSAGE_SELECT = `
   SELECT m.id, m.content, m.created_at, m.reply_to_id,
          m.attachment_url, m.attachment_name, m.attachment_mime,
-         u.username, u.avatar_color,
+         u.username, u.avatar_color, u.avatar_url,
          ru.username AS reply_username,
          rm.content AS reply_content
   FROM messages m

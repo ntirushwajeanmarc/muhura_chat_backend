@@ -17,11 +17,15 @@ const initDB = async () => {
         phone VARCHAR(20),
         password_hash VARCHAR(255) NOT NULL,
         avatar_color VARCHAR(7) DEFAULT '#6366f1',
+        avatar_url VARCHAR(500),
+        bio VARCHAR(200),
         created_at TIMESTAMPTZ DEFAULT NOW()
       );
 
       ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR(20);
       ALTER TABLE users ADD COLUMN IF NOT EXISTS surname VARCHAR(50);
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url VARCHAR(500);
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS bio VARCHAR(200);
 
       CREATE TABLE IF NOT EXISTS rooms (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
