@@ -6,6 +6,7 @@ const multer = require('multer');
 const { v4: uuidv4 } = require('uuid');
 const { pool } = require('./db');
 const { authenticate } = require('./auth');
+const { bufferToBase64 } = require('./fileStorage');
 
 const router = express.Router();
 
@@ -155,20 +156,24 @@ router.post('/avatar', authenticate, (req, res) => {
     try {
       const current = await pool.query('SELECT avatar_url FROM users WHERE id = $1', [req.user.id]);
       const oldUrl = current.rows[0]?.avatar_url;
-      const avatarUrl = `/uploads/avatars/${req.file.filename}`;
+      const base64 = bufferToBase64(fs.readFileSync(req.file.path));
+      const mime = req.file.mimetype || 'image/jpeg';
+      const avatarUrl = `/avatars/user/${req.user.id}`;
 
       const result = await pool.query(
-        `UPDATE users SET avatar_url = $1 WHERE id = $2
+        `UPDATE users SET avatar_url = $1, avatar_data = $2, avatar_mime = $3, avatar_image = NULL WHERE id = $4
          RETURNING id, username, surname, email, phone, bio, avatar_color, avatar_url`,
-        [avatarUrl, req.user.id]
+        [avatarUrl, base64, mime, req.user.id]
       );
 
       deleteLocalAvatar(oldUrl);
+      fs.unlink(req.file.path, () => {});
       const user = formatUser(result.rows[0]);
       const token = issueToken(user);
       res.json({ user, token });
     } catch (uploadErr) {
       fs.unlink(req.file.path, () => {});
+      console.error('Avatar upload error:', uploadErr);
       res.status(500).json({ error: 'Server error' });
     }
   });
@@ -180,7 +185,7 @@ router.delete('/avatar', authenticate, async (req, res) => {
     const oldUrl = current.rows[0]?.avatar_url;
 
     const result = await pool.query(
-      `UPDATE users SET avatar_url = NULL WHERE id = $1
+      `UPDATE users SET avatar_url = NULL, avatar_data = NULL, avatar_image = NULL, avatar_mime = NULL WHERE id = $1
        RETURNING id, username, surname, email, phone, bio, avatar_color, avatar_url`,
       [req.user.id]
     );

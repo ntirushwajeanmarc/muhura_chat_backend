@@ -25,6 +25,9 @@ const initDB = async () => {
       ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR(20);
       ALTER TABLE users ADD COLUMN IF NOT EXISTS surname VARCHAR(50);
       ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url VARCHAR(500);
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_image BYTEA;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_data TEXT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_mime VARCHAR(50);
       ALTER TABLE users ADD COLUMN IF NOT EXISTS bio VARCHAR(200);
 
       CREATE TABLE IF NOT EXISTS rooms (
@@ -61,6 +64,7 @@ const initDB = async () => {
       ALTER TABLE messages ADD COLUMN IF NOT EXISTS attachment_url VARCHAR(500);
       ALTER TABLE messages ADD COLUMN IF NOT EXISTS attachment_name VARCHAR(255);
       ALTER TABLE messages ADD COLUMN IF NOT EXISTS attachment_mime VARCHAR(100);
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS attachment_data TEXT;
       ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ;
 
       CREATE INDEX IF NOT EXISTS idx_messages_room_created ON messages(room_id, created_at DESC);

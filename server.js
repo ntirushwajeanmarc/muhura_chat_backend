@@ -11,6 +11,7 @@ const { v4: uuidv4 } = require('uuid');
 const { pool, initDB } = require('./db');
 const { router: authRouter, authenticate } = require('./auth');
 const { router: profileRouter } = require('./profile');
+const { bufferToBase64, resolveStoredBytes } = require('./fileStorage');
 
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
@@ -242,7 +243,58 @@ function sendStoredFile(res, diskPath, { mime, filename, forceDownload = false }
 app.get('/api/files', authenticate, async (req, res) => {
   try {
     const urlPath = req.query.path;
-    if (!urlPath || typeof urlPath !== 'string' || !urlPath.startsWith('/uploads/') || urlPath.includes('..')) {
+    if (!urlPath || typeof urlPath !== 'string' || urlPath.includes('..')) {
+      return res.status(400).json({ error: 'Invalid path' });
+    }
+
+    const forceDownload = req.query.download === '1' || req.query.download === 'true';
+
+    // Profile photos stored as base64 in DB
+    if (urlPath.startsWith('/avatars/user/')) {
+      const userId = urlPath.slice('/avatars/user/'.length).split('/')[0];
+      if (!userId) return res.status(400).json({ error: 'Invalid path' });
+      const avatar = await pool.query(
+        `SELECT avatar_data, avatar_image, avatar_mime FROM users
+         WHERE id = $1 AND (avatar_data IS NOT NULL OR avatar_image IS NOT NULL)`,
+        [userId]
+      );
+      const bytes = resolveStoredBytes(avatar.rows[0], { dataKey: 'avatar_data', binaryKey: 'avatar_image' });
+      if (!bytes) return res.status(404).json({ error: 'Avatar not found' });
+      res.type(avatar.rows[0].avatar_mime || 'image/jpeg');
+      if (forceDownload) {
+        res.setHeader('Content-Disposition', 'attachment; filename="avatar.jpg"');
+      } else {
+        res.setHeader('Content-Disposition', 'inline');
+      }
+      return res.send(bytes);
+    }
+
+    // Message attachments stored as base64 in DB
+    if (urlPath.startsWith('/attachments/db/')) {
+      const messageId = urlPath.slice('/attachments/db/'.length).split('/')[0];
+      if (!messageId) return res.status(400).json({ error: 'Invalid path' });
+      const row = await pool.query(
+        `SELECT room_id, attachment_data, attachment_mime, attachment_name
+         FROM messages WHERE id = $1 AND attachment_data IS NOT NULL`,
+        [messageId]
+      );
+      if (!row.rows[0]) return res.status(404).json({ error: 'File not found' });
+      if (!(await canAccessRoom(req.user.id, row.rows[0].room_id))) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
+      const bytes = resolveStoredBytes(row.rows[0], { dataKey: 'attachment_data' });
+      const mime = row.rows[0].attachment_mime || 'application/octet-stream';
+      const inline = !forceDownload && mime.startsWith('image/');
+      res.type(mime);
+      const safeName = (row.rows[0].attachment_name || 'file').replace(/[^\w.\-() ]+/g, '_');
+      res.setHeader(
+        'Content-Disposition',
+        inline ? `inline; filename="${safeName}"` : `attachment; filename="${safeName}"`
+      );
+      return res.send(bytes);
+    }
+
+    if (!urlPath.startsWith('/uploads/')) {
       return res.status(400).json({ error: 'Invalid path' });
     }
 
@@ -250,8 +302,6 @@ app.get('/api/files', authenticate, async (req, res) => {
     if (!diskPath || !fs.existsSync(diskPath)) {
       return res.status(404).json({ error: 'File not found' });
     }
-
-    const forceDownload = req.query.download === '1' || req.query.download === 'true';
 
     if (urlPath.includes('/avatars/')) {
       const owner = await pool.query('SELECT id FROM users WHERE avatar_url = $1', [urlPath]);
@@ -261,10 +311,23 @@ app.get('/api/files', authenticate, async (req, res) => {
     }
 
     const msg = await pool.query(
-      'SELECT room_id, attachment_name, attachment_mime FROM messages WHERE attachment_url = $1 LIMIT 1',
+      `SELECT id, room_id, attachment_name, attachment_mime, attachment_data
+       FROM messages WHERE attachment_url = $1 LIMIT 1`,
       [urlPath]
     );
     if (msg.rows[0] && (await canAccessRoom(req.user.id, msg.rows[0].room_id))) {
+      const dbBytes = resolveStoredBytes(msg.rows[0], { dataKey: 'attachment_data' });
+      if (dbBytes) {
+        const mime = msg.rows[0].attachment_mime || 'application/octet-stream';
+        const inline = !forceDownload && mime.startsWith('image/');
+        res.type(mime);
+        const safeName = (msg.rows[0].attachment_name || 'file').replace(/[^\w.\-() ]+/g, '_');
+        res.setHeader(
+          'Content-Disposition',
+          inline ? `inline; filename="${safeName}"` : `attachment; filename="${safeName}"`
+        );
+        return res.send(dbBytes);
+      }
       return sendStoredFile(res, diskPath, {
         mime: msg.rows[0].attachment_mime,
         filename: msg.rows[0].attachment_name,
@@ -560,24 +623,33 @@ app.post('/api/rooms/:roomId/upload', authenticate, (req, res) => {
         }
       }
 
-      const attachmentUrl = `/uploads/${req.file.filename}`;
       const fileMime = resolveStoredMime(
         req.file.mimetype,
         path.join(UPLOAD_DIR, req.file.filename)
       );
-      const result = await pool.query(
-        `INSERT INTO messages (room_id, user_id, content, reply_to_id, attachment_url, attachment_name, attachment_mime)
+      const attachmentData = bufferToBase64(fs.readFileSync(req.file.path));
+      fs.unlink(req.file.path, () => {});
+
+      const inserted = await pool.query(
+        `INSERT INTO messages (room_id, user_id, content, reply_to_id, attachment_name, attachment_mime, attachment_data)
          VALUES ($1, $2, $3, $4, $5, $6, $7)
-         RETURNING id, content, created_at, attachment_url, attachment_name, attachment_mime`,
+         RETURNING id, content, created_at, attachment_name, attachment_mime`,
         [
           roomId,
           req.user.id,
           caption,
           replyTo?.id || null,
-          attachmentUrl,
           req.file.originalname,
           fileMime,
+          attachmentData,
         ]
+      );
+
+      const attachmentUrl = `/attachments/db/${inserted.rows[0].id}`;
+      const result = await pool.query(
+        `UPDATE messages SET attachment_url = $1 WHERE id = $2
+         RETURNING id, content, created_at, attachment_url, attachment_name, attachment_mime`,
+        [attachmentUrl, inserted.rows[0].id]
       );
 
       const row = result.rows[0];
@@ -585,7 +657,7 @@ app.post('/api/rooms/:roomId/upload', authenticate, (req, res) => {
       io.to(roomId).emit('new_message', msg);
       res.json({ message: formatMessageRow({ ...row, username: req.user.username, avatar_color: req.user.avatar_color, reply_to_id: replyTo?.id, reply_username: replyTo?.username, reply_content: replyTo?.content }) });
     } catch (uploadErr) {
-      fs.unlink(req.file.path, () => {});
+      if (req.file?.path) fs.unlink(req.file.path, () => {});
       console.error('Upload error:', uploadErr);
       res.status(500).json({ error: 'Server error' });
     }
