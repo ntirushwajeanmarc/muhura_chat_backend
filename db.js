@@ -134,6 +134,17 @@ const initDB = async () => {
       );
 
       CREATE INDEX IF NOT EXISTS idx_push_subscriptions_user ON push_subscriptions(user_id);
+
+      CREATE TABLE IF NOT EXISTS fcm_tokens (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        token TEXT NOT NULL,
+        platform VARCHAR(20) DEFAULT 'android',
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE (user_id, token)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_fcm_tokens_user ON fcm_tokens(user_id);
     `);
 
     // Merge duplicate rooms (keeps oldest per name, moves messages to kept room)

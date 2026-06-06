@@ -2,6 +2,7 @@ const express = require('express');
 const webpush = require('web-push');
 const { pool } = require('./db');
 const { authenticate } = require('./auth');
+const { sendFcmToUser } = require('./fcm');
 
 const router = express.Router();
 
@@ -61,35 +62,38 @@ async function getSubscriptionsForUser(userId) {
 }
 
 async function sendToUser(userId, payload) {
-  if (!configured) return;
-  const subs = await getSubscriptionsForUser(userId);
-  if (!subs.length) return;
+  const tasks = [sendFcmToUser(userId, payload)];
 
-  const payloadStr = JSON.stringify(payload);
-  await Promise.allSettled(
-    subs.map(async (sub) => {
-      try {
-        await webpush.sendNotification(
-          {
-            endpoint: sub.endpoint,
-            keys: { p256dh: sub.p256dh, auth: sub.auth },
-          },
-          payloadStr
-        );
-      } catch (err) {
-        if (err.statusCode === 404 || err.statusCode === 410) {
-          await pool.query(
-            'DELETE FROM push_subscriptions WHERE user_id = $1 AND endpoint = $2',
-            [userId, sub.endpoint]
+  if (configured) {
+    const subs = await getSubscriptionsForUser(userId);
+    const payloadStr = JSON.stringify(payload);
+    tasks.push(
+      ...subs.map(async (sub) => {
+        try {
+          await webpush.sendNotification(
+            {
+              endpoint: sub.endpoint,
+              keys: { p256dh: sub.p256dh, auth: sub.auth },
+            },
+            payloadStr
           );
+        } catch (err) {
+          if (err.statusCode === 404 || err.statusCode === 410) {
+            await pool.query(
+              'DELETE FROM push_subscriptions WHERE user_id = $1 AND endpoint = $2',
+              [userId, sub.endpoint]
+            );
+          }
         }
-      }
-    })
-  );
+      })
+    );
+  }
+
+  await Promise.allSettled(tasks);
 }
 
 async function notifyRoomMessage(msg, senderUserId) {
-  if (!configured || !msg?.room_id) return;
+  if (!msg?.room_id) return;
 
   const memberIds = await getRoomMembers(msg.room_id, senderUserId);
   if (!memberIds.length) return;
@@ -116,7 +120,7 @@ async function notifyRoomMessage(msg, senderUserId) {
 }
 
 async function notifyIncomingCall(toUserId, fromUser, callId, callType) {
-  if (!configured || !toUserId || !callId) return;
+  if (!toUserId || !callId) return;
 
   const label = callType === 'video' ? 'Video' : 'Voice';
   await sendToUser(toUserId, {
@@ -154,6 +158,39 @@ router.post('/subscribe', authenticate, async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     console.error('Push subscribe error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+router.post('/fcm-register', authenticate, async (req, res) => {
+  const { token, platform } = req.body;
+  if (!token || typeof token !== 'string') {
+    return res.status(400).json({ error: 'token required' });
+  }
+  try {
+    await pool.query(
+      `INSERT INTO fcm_tokens (user_id, token, platform)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (user_id, token) DO UPDATE SET platform = EXCLUDED.platform`,
+      [req.user.id, token.trim(), platform || 'android']
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('FCM register error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+router.delete('/fcm-register', authenticate, async (req, res) => {
+  const { token } = req.body;
+  if (!token) return res.status(400).json({ error: 'token required' });
+  try {
+    await pool.query(
+      'DELETE FROM fcm_tokens WHERE user_id = $1 AND token = $2',
+      [req.user.id, token]
+    );
+    res.json({ ok: true });
+  } catch (err) {
     res.status(500).json({ error: 'Server error' });
   }
 });
