@@ -12,6 +12,12 @@ const { pool, initDB } = require('./db');
 const { router: authRouter, authenticate } = require('./auth');
 const { router: profileRouter } = require('./profile');
 const { router: socialRouter } = require('./social');
+const {
+  router: pushRouter,
+  configureVapid,
+  notifyRoomMessage,
+  notifyIncomingCall,
+} = require('./push');
 const { bufferToBase64, resolveStoredBytes } = require('./fileStorage');
 
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
@@ -234,9 +240,12 @@ app.use(express.json());
 // Files served only via authenticated /api/files (see below)
 
 // Routes
+configureVapid();
+
 app.use('/api/auth', authRouter);
 app.use('/api/profile', profileRouter);
 app.use('/api/social', socialRouter);
+app.use('/api/push', pushRouter);
 
 function resolveUploadPath(urlPath) {
   const uploadRoot = path.resolve(UPLOAD_DIR);
@@ -517,6 +526,67 @@ app.get('/api/rooms/search', authenticate, async (req, res) => {
       }))
     );
   } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+function normalizeChannelName(name) {
+  return (name || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, '-')
+    .replace(/[^a-z0-9-]/g, '')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+}
+
+// Create a public channel
+app.post('/api/rooms', authenticate, async (req, res) => {
+  try {
+    const channelName = normalizeChannelName(req.body.name);
+    const description = (req.body.description || '').trim().slice(0, 255) || null;
+
+    if (!channelName || channelName.length < 2) {
+      return res.status(400).json({ error: 'Channel name must be at least 2 characters (letters, numbers, hyphens)' });
+    }
+    if (channelName.length > 50) {
+      return res.status(400).json({ error: 'Channel name is too long' });
+    }
+
+    const existing = await pool.query(
+      `SELECT id FROM rooms WHERE type = 'public' AND name = $1`,
+      [channelName]
+    );
+    if (existing.rows.length > 0) {
+      return res.status(409).json({ error: 'Channel name already taken' });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO rooms (name, description, type, created_by)
+       VALUES ($1, $2, 'public', $3)
+       RETURNING id, name, description, type, created_at`,
+      [channelName, description, req.user.id]
+    );
+    const room = result.rows[0];
+
+    await pool.query(
+      `INSERT INTO room_members (room_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+      [room.id, req.user.id]
+    );
+
+    res.status(201).json({
+      id: room.id,
+      name: room.name,
+      description: room.description,
+      type: 'public',
+      display_name: room.name,
+      created_at: room.created_at,
+    });
+  } catch (err) {
+    if (err.code === '23505') {
+      return res.status(409).json({ error: 'Channel name already taken' });
+    }
+    console.error('Create channel error:', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -880,6 +950,7 @@ app.post('/api/rooms/:roomId/upload', authenticate, (req, res) => {
       const row = result.rows[0];
       const msg = buildLiveMessage(row, req.user, roomId, replyTo);
       io.to(roomId).emit('new_message', msg);
+      notifyRoomMessage(msg, req.user.id).catch(() => {});
       res.json({ message: formatMessageRow({ ...row, username: req.user.username, avatar_color: req.user.avatar_color, reply_to_id: replyTo?.id, reply_username: replyTo?.username, reply_content: replyTo?.content }) });
     } catch (uploadErr) {
       if (req.file?.path) fs.unlink(req.file.path, () => {});
@@ -1220,6 +1291,7 @@ io.on('connection', async (socket) => {
       );
       const msg = buildLiveMessage(result.rows[0], socket.user, roomId, replyTo);
       io.to(roomId).emit('new_message', msg);
+      notifyRoomMessage(msg, socket.user.id).catch(() => {});
     } catch (err) {
       console.error('Message error:', err);
     }
@@ -1287,6 +1359,8 @@ io.on('connection', async (socket) => {
         avatar_url: fromUser.avatar_url || null,
       },
     });
+
+    notifyIncomingCall(toUserId, fromUser, callId, callType || 'audio').catch(() => {});
 
     socket.emit('call_delivered', { callId, toUserId });
   });
