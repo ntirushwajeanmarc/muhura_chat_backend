@@ -29,10 +29,10 @@ function messagePreview(msg) {
     const mime = msg.attachment.mime || '';
     const name = msg.attachment.name || '';
     const isImg = mime.startsWith('image/') || /\.(jpe?g|png|gif|webp)$/i.test(name);
-    return isImg ? '📷 Photo' : `📎 ${name || 'File'}`;
+    return isImg ? 'Sent a photo' : `Sent a file: ${name || 'attachment'}`;
   }
   const text = (msg.content || '').trim();
-  if (!text) return 'New message';
+  if (!text) return 'Sent a message';
   return text.length > 80 ? `${text.slice(0, 80)}…` : text;
 }
 
@@ -95,15 +95,16 @@ async function notifyRoomMessage(msg, senderUserId) {
   if (!memberIds.length) return;
 
   const room = await getRoomInfo(msg.room_id);
-  const body = messagePreview(msg);
-  const title = room?.type === 'direct'
-    ? msg.username
-    : `${msg.username} in ${room?.name || 'chat'}`;
+  const preview = messagePreview(msg);
+  const sender = msg.username || 'Someone';
+  const body = room?.type === 'direct'
+    ? `${sender}: ${preview}`
+    : `${sender} in #${room?.name || 'chat'}: ${preview}`;
 
   await Promise.allSettled(
     memberIds.map((userId) =>
       sendToUser(userId, {
-        title,
+        title: 'EganirA',
         body,
         type: 'message',
         roomId: msg.room_id,
@@ -117,10 +118,10 @@ async function notifyRoomMessage(msg, senderUserId) {
 async function notifyIncomingCall(toUserId, fromUser, callId, callType) {
   if (!configured || !toUserId || !callId) return;
 
-  const label = callType === 'video' ? 'video' : 'voice';
+  const label = callType === 'video' ? 'Video' : 'Voice';
   await sendToUser(toUserId, {
-    title: `Incoming ${label} call`,
-    body: `${fromUser.username} is calling you`,
+    title: 'EganirA',
+    body: `${label} call from ${fromUser.username}`,
     type: 'call',
     callId,
     fromUserId: fromUser.id,
