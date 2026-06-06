@@ -12,8 +12,9 @@ const router = express.Router();
 
 const AVATAR_DIR = path.join(__dirname, 'uploads', 'avatars');
 const AVATAR_COLORS = ['#6366f1', '#ec4899', '#14b8a6', '#f59e0b', '#10b981', '#3b82f6', '#8b5cf6', '#ef4444', '#25d366'];
-const CHAT_WALLPAPERS = ['default', 'dark', 'teal', 'midnight', 'warm'];
+const CHAT_WALLPAPERS = ['default', 'dark', 'teal', 'midnight', 'warm', 'custom'];
 const MAX_AVATAR_SIZE = 3 * 1024 * 1024;
+const MAX_WALLPAPER_SIZE = 5 * 1024 * 1024;
 
 if (!fs.existsSync(AVATAR_DIR)) {
   fs.mkdirSync(AVATAR_DIR, { recursive: true });
@@ -39,6 +40,10 @@ function formatUser(row) {
     avatar_color: row.avatar_color,
     avatar_url: row.avatar_url || null,
     chat_wallpaper: row.chat_wallpaper || 'default',
+    wallpaper_url:
+      row.chat_wallpaper === 'custom' && (row.wallpaper_data || row.wallpaper_image)
+        ? `/wallpapers/user/${row.id}`
+        : null,
   };
   if (row.like_count !== undefined && row.like_count !== null) {
     user.like_count = parseInt(row.like_count, 10) || 0;
@@ -249,7 +254,7 @@ router.patch('/', authenticate, async (req, res) => {
     values.push(req.user.id);
     const result = await pool.query(
       `UPDATE users SET ${updates.join(', ')} WHERE id = $${i}
-       RETURNING id, username, surname, email, phone, bio, avatar_color, avatar_url, chat_wallpaper`,
+       RETURNING id, username, surname, email, phone, bio, avatar_color, avatar_url, chat_wallpaper, wallpaper_data`,
       values
     );
     const user = formatUser(result.rows[0]);
@@ -299,6 +304,56 @@ router.post('/avatar', authenticate, (req, res) => {
     } catch (uploadErr) {
       fs.unlink(req.file.path, () => {});
       console.error('Avatar upload error:', uploadErr);
+      res.status(500).json({ error: 'Server error' });
+    }
+  });
+});
+
+const wallpaperUpload = multer({
+  storage: multer.diskStorage({
+    destination: AVATAR_DIR,
+    filename: (_req, file, cb) => {
+      const ext = path.extname(file.originalname).toLowerCase() || '.jpg';
+      cb(null, `wp-${uuidv4()}${ext}`);
+    },
+  }),
+  limits: { fileSize: MAX_WALLPAPER_SIZE },
+  fileFilter: (_req, file, cb) => {
+    if (['image/jpeg', 'image/png', 'image/gif', 'image/webp'].includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only image files are allowed for wallpaper'));
+    }
+  },
+});
+
+router.post('/wallpaper', authenticate, (req, res) => {
+  wallpaperUpload.single('photo')(req, res, async (err) => {
+    if (err) {
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        return res.status(400).json({ error: 'Photo too large (max 5 MB)' });
+      }
+      return res.status(400).json({ error: err.message || 'Upload failed' });
+    }
+    if (!req.file) return res.status(400).json({ error: 'No photo provided' });
+
+    try {
+      const base64 = bufferToBase64(fs.readFileSync(req.file.path));
+      const mime = req.file.mimetype || 'image/jpeg';
+
+      const result = await pool.query(
+        `UPDATE users SET chat_wallpaper = 'custom', wallpaper_data = $1, wallpaper_mime = $2 WHERE id = $3
+         RETURNING id, username, surname, email, phone, bio, avatar_color, avatar_url, chat_wallpaper, wallpaper_data`,
+        [base64, mime, req.user.id]
+      );
+
+      fs.unlink(req.file.path, () => {});
+      const user = formatUser(result.rows[0]);
+      const token = issueToken(user);
+      res.json({ user, token });
+    } catch (uploadErr) {
+      fs.unlink(req.file.path, () => {});
+      console.error('Wallpaper upload error:', uploadErr);
       res.status(500).json({ error: 'Server error' });
     }
   });

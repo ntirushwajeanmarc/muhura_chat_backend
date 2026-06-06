@@ -345,6 +345,24 @@ app.get('/api/files', authenticate, async (req, res) => {
       return res.send(bytes);
     }
 
+    if (urlPath.startsWith('/wallpapers/user/')) {
+      const userId = urlPath.slice('/wallpapers/user/'.length).split('/')[0];
+      if (!userId) return res.status(400).json({ error: 'Invalid path' });
+      if (userId !== req.user.id) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
+      const row = await pool.query(
+        `SELECT wallpaper_data, wallpaper_mime FROM users
+         WHERE id = $1 AND wallpaper_data IS NOT NULL`,
+        [userId]
+      );
+      const bytes = resolveStoredBytes(row.rows[0], { dataKey: 'wallpaper_data' });
+      if (!bytes) return res.status(404).json({ error: 'Wallpaper not found' });
+      res.type(row.rows[0].wallpaper_mime || 'image/jpeg');
+      res.setHeader('Content-Disposition', 'inline');
+      return res.send(bytes);
+    }
+
     // Star images stored as base64 in DB
     if (urlPath.startsWith('/stars/db/')) {
       const starId = urlPath.slice('/stars/db/'.length).split('/')[0];
@@ -513,6 +531,39 @@ app.get('/api/rooms', authenticate, async (req, res) => {
       result.rows.map((r) => formatRoomRow({ ...r, type: 'public' }, req.user.id))
     );
     res.json(rooms);
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Browse public channels (discovery directory)
+app.get('/api/rooms/discover', authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT r.id, r.name, r.description, r.type, r.created_at,
+              (
+                EXISTS (SELECT 1 FROM room_members rm WHERE rm.room_id = r.id AND rm.user_id = $1)
+                OR EXISTS (SELECT 1 FROM messages m WHERE m.room_id = r.id AND m.user_id = $1)
+              ) AS joined,
+              (SELECT COUNT(*)::int FROM room_members rm2 WHERE rm2.room_id = r.id) AS member_count
+       FROM rooms r
+       WHERE r.type = 'public'
+       ORDER BY r.created_at DESC
+       LIMIT 30`,
+      [req.user.id]
+    );
+    res.json(
+      result.rows.map((r) => ({
+        id: r.id,
+        name: r.name,
+        description: r.description,
+        type: 'public',
+        display_name: r.name,
+        joined: !!r.joined,
+        member_count: r.member_count || 0,
+        created_at: r.created_at,
+      }))
+    );
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
   }
@@ -1033,6 +1084,79 @@ app.get('/api/rooms/:roomId/messages', authenticate, async (req, res) => {
 
     const rows = result.rows.reverse().map(formatMessageRow);
     res.json({ messages: rows, hasMore: result.rows.length === limit });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/rooms/:roomId/messages/search', authenticate, async (req, res) => {
+  try {
+    const roomId = req.params.roomId;
+    if (!(await canAccessRoom(req.user.id, roomId))) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const q = (req.query.q || '').trim();
+    if (q.length < 1) return res.json({ messages: [] });
+
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 30, 1), 50);
+    const pattern = `%${q}%`;
+
+    const result = await pool.query(
+      `${messageSelectSql(3)}
+       WHERE m.room_id = $1 AND m.content ILIKE $2
+       ORDER BY m.created_at DESC
+       LIMIT $4`,
+      [roomId, pattern, req.user.id, limit]
+    );
+
+    res.json({ messages: result.rows.map(formatMessageRow), query: q });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/rooms/:roomId/messages/context/:messageId', authenticate, async (req, res) => {
+  try {
+    const { roomId, messageId } = req.params;
+    if (!(await canAccessRoom(req.user.id, roomId))) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const anchor = await pool.query(
+      'SELECT created_at FROM messages WHERE id = $1 AND room_id = $2',
+      [messageId, roomId]
+    );
+    if (!anchor.rows[0]) return res.status(404).json({ error: 'Message not found' });
+
+    const createdAt = anchor.rows[0].created_at;
+    const before = await pool.query(
+      `${messageSelectSql(3)}
+       WHERE m.room_id = $1 AND m.created_at < $2
+       ORDER BY m.created_at DESC
+       LIMIT 25`,
+      [roomId, createdAt, req.user.id]
+    );
+    const at = await pool.query(
+      `${messageSelectSql(3)}
+       WHERE m.room_id = $1 AND m.id = $2`,
+      [roomId, messageId, req.user.id]
+    );
+    const after = await pool.query(
+      `${messageSelectSql(3)}
+       WHERE m.room_id = $1 AND m.created_at > $2
+       ORDER BY m.created_at ASC
+       LIMIT 25`,
+      [roomId, createdAt, req.user.id]
+    );
+
+    const messages = [
+      ...before.rows.reverse(),
+      ...at.rows,
+      ...after.rows,
+    ].map(formatMessageRow);
+
+    res.json({ messages, anchorId: messageId });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
   }
