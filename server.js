@@ -1259,19 +1259,41 @@ io.on('connection', async (socket) => {
   socket.on('call_invite', async ({ toUserId, callId, callType, sdp }) => {
     if (!toUserId || !callId || !sdp) return;
     if (toUserId === socket.user.id) return;
-    const target = await pool.query('SELECT id, username FROM users WHERE id = $1', [toUserId]);
+    const target = await pool.query(
+      'SELECT id, username, avatar_color, avatar_url FROM users WHERE id = $1',
+      [toUserId]
+    );
     if (!target.rows[0]) return;
+
+    const caller = await pool.query(
+      'SELECT id, username, avatar_color, avatar_url FROM users WHERE id = $1',
+      [socket.user.id]
+    );
+    const fromUser = caller.rows[0] || {
+      id: socket.user.id,
+      username: socket.user.username,
+      avatar_color: socket.user.avatar_color,
+      avatar_url: socket.user.avatar_url || null,
+    };
+
     io.to(`user:${toUserId}`).emit('call_invite', {
       callId,
       callType: callType || 'audio',
       sdp,
       from: {
-        id: socket.user.id,
-        username: socket.user.username,
-        avatar_color: socket.user.avatar_color,
-        avatar_url: socket.user.avatar_url || null,
+        id: fromUser.id,
+        username: fromUser.username,
+        avatar_color: fromUser.avatar_color,
+        avatar_url: fromUser.avatar_url || null,
       },
     });
+
+    socket.emit('call_delivered', { callId, toUserId });
+  });
+
+  socket.on('call_ringing', ({ toUserId, callId }) => {
+    if (!toUserId || !callId) return;
+    io.to(`user:${toUserId}`).emit('call_ringing', { callId, fromUserId: socket.user.id });
   });
 
   socket.on('call_answer', ({ toUserId, callId, sdp }) => {
