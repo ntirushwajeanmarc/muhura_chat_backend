@@ -674,6 +674,17 @@ app.get('/api/chats', authenticate, async (req, res) => {
   }
 });
 
+// Unread message counts per room (messages from others since last read)
+app.get('/api/chats/unread-counts', authenticate, async (req, res) => {
+  try {
+    const counts = await getUnreadCountsForUser(req.user.id);
+    res.json({ counts });
+  } catch (err) {
+    console.error('Unread counts error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // Start or open a direct chat
 app.post('/api/chats/direct', authenticate, async (req, res) => {
   try {
@@ -1009,6 +1020,28 @@ async function getMessageCreatedAt(messageId, roomId) {
     [messageId, roomId]
   );
   return result.rows[0]?.created_at || null;
+}
+
+async function getUnreadCountsForUser(userId) {
+  const result = await pool.query(
+    `SELECT m.room_id, COUNT(*)::int AS unread_count
+     FROM messages m
+     INNER JOIN room_members rm ON rm.room_id = m.room_id AND rm.user_id = $1
+     LEFT JOIN room_read_state rrs ON rrs.room_id = m.room_id AND rrs.user_id = $1
+     LEFT JOIN messages read_msg ON read_msg.id = rrs.last_read_message_id
+     WHERE m.user_id <> $1
+       AND (
+         rrs.last_read_message_id IS NULL
+         OR m.created_at > read_msg.created_at
+       )
+     GROUP BY m.room_id`,
+    [userId]
+  );
+  const counts = {};
+  for (const row of result.rows) {
+    counts[row.room_id] = row.unread_count;
+  }
+  return counts;
 }
 
 async function markRoomRead(userId, roomId, messageId) {
