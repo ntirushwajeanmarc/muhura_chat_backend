@@ -11,6 +11,7 @@ const { v4: uuidv4 } = require('uuid');
 const { pool, initDB } = require('./db');
 const { router: authRouter, authenticate } = require('./auth');
 const { router: profileRouter } = require('./profile');
+const { router: socialRouter } = require('./social');
 const { bufferToBase64, resolveStoredBytes } = require('./fileStorage');
 
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
@@ -225,6 +226,8 @@ const io = new Server(server, {
   }
 });
 
+app.set('io', io);
+
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
 app.use(express.json());
@@ -233,6 +236,7 @@ app.use(express.json());
 // Routes
 app.use('/api/auth', authRouter);
 app.use('/api/profile', profileRouter);
+app.use('/api/social', socialRouter);
 
 function resolveUploadPath(urlPath) {
   const uploadRoot = path.resolve(UPLOAD_DIR);
@@ -311,6 +315,36 @@ app.get('/api/files', authenticate, async (req, res) => {
       } else {
         res.setHeader('Content-Disposition', 'inline');
       }
+      return res.send(bytes);
+    }
+
+    // Star images stored as base64 in DB
+    if (urlPath.startsWith('/stars/db/')) {
+      const starId = urlPath.slice('/stars/db/'.length).split('/')[0];
+      if (!starId) return res.status(400).json({ error: 'Invalid path' });
+      const row = await pool.query(
+        `SELECT s.user_id, s.image_data, s.image_mime, s.expires_at
+         FROM stars s WHERE s.id = $1 AND s.image_data IS NOT NULL`,
+        [starId]
+      );
+      if (!row.rows[0]) return res.status(404).json({ error: 'Star not found' });
+      if (new Date(row.rows[0].expires_at) < new Date()) {
+        return res.status(410).json({ error: 'Star expired' });
+      }
+      const viewerId = req.user.id;
+      const authorId = row.rows[0].user_id;
+      if (authorId !== viewerId) {
+        const followCheck = await pool.query(
+          'SELECT 1 FROM follows WHERE follower_id = $1 AND following_id = $2',
+          [viewerId, authorId]
+        );
+        if (followCheck.rows.length === 0) {
+          return res.status(403).json({ error: 'Access denied' });
+        }
+      }
+      const bytes = resolveStoredBytes(row.rows[0], { dataKey: 'image_data' });
+      res.type(row.rows[0].image_mime || 'image/jpeg');
+      res.setHeader('Content-Disposition', 'inline');
       return res.send(bytes);
     }
 

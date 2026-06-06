@@ -127,7 +127,13 @@ router.get('/user/:userId', authenticate, async (req, res) => {
               EXISTS(
                 SELECT 1 FROM profile_likes pl2
                 WHERE pl2.liked_user_id = u.id AND pl2.liker_id = $2
-              ) AS liked_by_me
+              ) AS liked_by_me,
+              (SELECT COUNT(*)::int FROM follows f WHERE f.following_id = u.id) AS follower_count,
+              (SELECT COUNT(*)::int FROM follows f2 WHERE f2.follower_id = u.id) AS following_count,
+              EXISTS(
+                SELECT 1 FROM follows f3
+                WHERE f3.follower_id = $2 AND f3.following_id = u.id
+              ) AS followed_by_me
        FROM users u WHERE u.id = $1`,
       [userId, req.user.id]
     );
@@ -144,6 +150,9 @@ router.get('/user/:userId', authenticate, async (req, res) => {
         avatar_url: row.avatar_url || null,
         like_count: parseInt(row.like_count, 10) || 0,
         liked_by_me: !!row.liked_by_me,
+        follower_count: parseInt(row.follower_count, 10) || 0,
+        following_count: parseInt(row.following_count, 10) || 0,
+        followed_by_me: !!row.followed_by_me,
       },
     });
   } catch (err) {

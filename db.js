@@ -95,6 +95,30 @@ const initDB = async () => {
 
       CREATE INDEX IF NOT EXISTS idx_message_likes_message ON message_likes(message_id);
       CREATE INDEX IF NOT EXISTS idx_profile_likes_user ON profile_likes(liked_user_id);
+
+      CREATE TABLE IF NOT EXISTS follows (
+        follower_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        following_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        PRIMARY KEY (follower_id, following_id),
+        CHECK (follower_id <> following_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_follows_following ON follows(following_id);
+      CREATE INDEX IF NOT EXISTS idx_follows_follower ON follows(follower_id);
+
+      CREATE TABLE IF NOT EXISTS stars (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        content TEXT,
+        image_data TEXT,
+        image_mime VARCHAR(50),
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        expires_at TIMESTAMPTZ DEFAULT NOW() + INTERVAL '24 hours'
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_stars_user_created ON stars(user_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_stars_expires ON stars(expires_at);
     `);
 
     // Merge duplicate rooms (keeps oldest per name, moves messages to kept room)
