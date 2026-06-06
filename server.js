@@ -1380,8 +1380,35 @@ io.use((socket, next) => {
   }
 });
 
-// Track online users per room
+// Track online users per room (actively viewing that room)
 const onlineUsers = new Map(); // roomId -> Set of usernames
+
+// Global app presence — connected socket count per user id
+const onlineConnectionCount = new Map(); // userId -> number of open sockets
+
+function getOnlineUserIds() {
+  return [...onlineConnectionCount.keys()];
+}
+
+function broadcastUserPresence(userId, online) {
+  io.emit('user_presence', { userId, online });
+}
+
+function markUserConnected(userId) {
+  const next = (onlineConnectionCount.get(userId) || 0) + 1;
+  onlineConnectionCount.set(userId, next);
+  if (next === 1) broadcastUserPresence(userId, true);
+}
+
+function markUserDisconnected(userId) {
+  const current = onlineConnectionCount.get(userId) || 0;
+  if (current <= 1) {
+    onlineConnectionCount.delete(userId);
+    broadcastUserPresence(userId, false);
+  } else {
+    onlineConnectionCount.set(userId, current - 1);
+  }
+}
 
 async function joinSocketToUserRooms(socket) {
   const userId = socket.user.id;
@@ -1410,6 +1437,8 @@ function notifyRoomAdded(roomId, userIds) {
 
 io.on('connection', async (socket) => {
   console.log(`🔌 ${socket.user.username} connected`);
+  markUserConnected(socket.user.id);
+  socket.emit('presence_snapshot', { onlineUserIds: getOnlineUserIds() });
   await joinSocketToUserRooms(socket);
 
   // Join a room to receive messages (can join multiple rooms)
@@ -1581,6 +1610,7 @@ io.on('connection', async (socket) => {
         users: [...onlineUsers.get(presenceRoom)],
       });
     }
+    markUserDisconnected(socket.user.id);
     console.log(`🔌 ${socket.user.username} disconnected`);
   });
 });
