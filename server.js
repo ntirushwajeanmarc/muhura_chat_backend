@@ -173,6 +173,21 @@ async function getParticipatedPublicRoomIds(userId) {
   return result.rows.map((row) => row.id);
 }
 
+function unreadCountSql(userParam) {
+  return `(
+    SELECT COUNT(*)::int
+    FROM messages um
+    LEFT JOIN room_read_state urrs ON urrs.room_id = um.room_id AND urrs.user_id = ${userParam}
+    LEFT JOIN messages uread ON uread.id = urrs.last_read_message_id
+    WHERE um.room_id = r.id
+      AND um.user_id <> ${userParam}
+      AND (
+        urrs.last_read_message_id IS NULL
+        OR um.created_at > uread.created_at
+      )
+  )`;
+}
+
 async function formatRoomRow(row, currentUserId) {
   const room = {
     id: row.id,
@@ -198,6 +213,9 @@ async function formatRoomRow(row, currentUserId) {
   }
   if (row.last_message) room.last_message = row.last_message;
   if (row.last_message_at) room.last_message_at = row.last_message_at;
+  if (row.unread_count !== undefined && row.unread_count !== null) {
+    room.unread_count = parseInt(row.unread_count, 10) || 0;
+  }
   return room;
 }
 
@@ -475,8 +493,14 @@ app.get('/api/users/search', authenticate, async (req, res) => {
 app.get('/api/rooms', authenticate, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT DISTINCT ON (r.name) r.id, r.name, r.description, r.type, r.created_by, r.created_at
+      `SELECT DISTINCT ON (r.name) r.id, r.name, r.description, r.type, r.created_by, r.created_at,
+              lm.content AS last_message, lm.created_at AS last_message_at,
+              ${unreadCountSql('$1')} AS unread_count
        FROM rooms r
+       LEFT JOIN LATERAL (
+         SELECT content, created_at FROM messages
+         WHERE room_id = r.id ORDER BY created_at DESC LIMIT 1
+       ) lm ON true
        WHERE r.type = 'public'
          AND (
            EXISTS (SELECT 1 FROM room_members rm WHERE rm.room_id = r.id AND rm.user_id = $1)
@@ -485,11 +509,9 @@ app.get('/api/rooms', authenticate, async (req, res) => {
        ORDER BY r.name, r.created_at ASC`,
       [req.user.id]
     );
-    const rooms = result.rows.map((r) => ({
-      ...r,
-      type: 'public',
-      display_name: r.name,
-    }));
+    const rooms = await Promise.all(
+      result.rows.map((r) => formatRoomRow({ ...r, type: 'public' }, req.user.id))
+    );
     res.json(rooms);
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
@@ -631,7 +653,8 @@ app.get('/api/chats', authenticate, async (req, res) => {
       `SELECT r.id, r.name, r.description, r.type, r.created_by, r.created_at,
               u.id AS peer_id, u.username AS peer_username, u.avatar_color AS peer_avatar_color,
               u.avatar_url AS peer_avatar_url,
-              lm.content AS last_message, lm.created_at AS last_message_at
+              lm.content AS last_message, lm.created_at AS last_message_at,
+              ${unreadCountSql('$1')} AS unread_count
        FROM rooms r
        JOIN room_members rm ON r.id = rm.room_id AND rm.user_id = $1
        JOIN room_members rm2 ON r.id = rm2.room_id AND rm2.user_id <> $1
@@ -648,7 +671,8 @@ app.get('/api/chats', authenticate, async (req, res) => {
     const groupResult = await pool.query(
       `SELECT r.id, r.name, r.description, r.type, r.created_by, r.created_at,
               (SELECT COUNT(*) FROM room_members WHERE room_id = r.id) AS member_count,
-              lm.content AS last_message, lm.created_at AS last_message_at
+              lm.content AS last_message, lm.created_at AS last_message_at,
+              ${unreadCountSql('$1')} AS unread_count
        FROM rooms r
        JOIN room_members rm ON r.id = rm.room_id AND rm.user_id = $1
        LEFT JOIN LATERAL (
@@ -1024,17 +1048,10 @@ async function getMessageCreatedAt(messageId, roomId) {
 
 async function getUnreadCountsForUser(userId) {
   const result = await pool.query(
-    `SELECT m.room_id, COUNT(*)::int AS unread_count
-     FROM messages m
-     INNER JOIN room_members rm ON rm.room_id = m.room_id AND rm.user_id = $1
-     LEFT JOIN room_read_state rrs ON rrs.room_id = m.room_id AND rrs.user_id = $1
-     LEFT JOIN messages read_msg ON read_msg.id = rrs.last_read_message_id
-     WHERE m.user_id <> $1
-       AND (
-         rrs.last_read_message_id IS NULL
-         OR m.created_at > read_msg.created_at
-       )
-     GROUP BY m.room_id`,
+    `SELECT r.id AS room_id, ${unreadCountSql('$1')} AS unread_count
+     FROM rooms r
+     JOIN room_members rm ON rm.room_id = r.id AND rm.user_id = $1
+     WHERE ${unreadCountSql('$1')} > 0`,
     [userId]
   );
   const counts = {};
