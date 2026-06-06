@@ -133,6 +133,39 @@ async function canAccessRoom(userId, roomId) {
   return member.rows.length > 0;
 }
 
+async function isGroupMember(userId, roomId) {
+  const result = await pool.query(
+    `SELECT 1 FROM rooms r
+     JOIN room_members rm ON rm.room_id = r.id AND rm.user_id = $2
+     WHERE r.id = $1 AND r.type = 'group'`,
+    [roomId, userId]
+  );
+  return result.rows.length > 0;
+}
+
+async function ensureChannelMembership(userId, roomId) {
+  const room = await pool.query('SELECT type FROM rooms WHERE id = $1', [roomId]);
+  if (room.rows[0]?.type !== 'public') return;
+  await pool.query(
+    `INSERT INTO room_members (room_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+    [roomId, userId]
+  );
+}
+
+async function getParticipatedPublicRoomIds(userId) {
+  const result = await pool.query(
+    `SELECT DISTINCT r.id
+     FROM rooms r
+     WHERE r.type = 'public'
+       AND (
+         EXISTS (SELECT 1 FROM room_members rm WHERE rm.room_id = r.id AND rm.user_id = $1)
+         OR EXISTS (SELECT 1 FROM messages m WHERE m.room_id = r.id AND m.user_id = $1)
+       )`,
+    [userId]
+  );
+  return result.rows.map((row) => row.id);
+}
+
 async function formatRoomRow(row, currentUserId) {
   const room = {
     id: row.id,
@@ -395,14 +428,19 @@ app.get('/api/users/search', authenticate, async (req, res) => {
   }
 });
 
-// Public channels (global rooms)
+// Public channels the user has participated in (not all channels)
 app.get('/api/rooms', authenticate, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT DISTINCT ON (name) id, name, description, type, created_by, created_at
-       FROM rooms
-       WHERE type = 'public'
-       ORDER BY name, created_at ASC`
+      `SELECT DISTINCT ON (r.name) r.id, r.name, r.description, r.type, r.created_by, r.created_at
+       FROM rooms r
+       WHERE r.type = 'public'
+         AND (
+           EXISTS (SELECT 1 FROM room_members rm WHERE rm.room_id = r.id AND rm.user_id = $1)
+           OR EXISTS (SELECT 1 FROM messages m WHERE m.room_id = r.id AND m.user_id = $1)
+         )
+       ORDER BY r.name, r.created_at ASC`,
+      [req.user.id]
     );
     const rooms = result.rows.map((r) => ({
       ...r,
@@ -410,6 +448,71 @@ app.get('/api/rooms', authenticate, async (req, res) => {
       display_name: r.name,
     }));
     res.json(rooms);
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Search all public channels (for discovery)
+app.get('/api/rooms/search', authenticate, async (req, res) => {
+  try {
+    const q = (req.query.q || '').trim();
+    if (q.length < 1) return res.json([]);
+    const pattern = `%${q}%`;
+    const result = await pool.query(
+      `SELECT r.id, r.name, r.description, r.type, r.created_at,
+              (
+                EXISTS (SELECT 1 FROM room_members rm WHERE rm.room_id = r.id AND rm.user_id = $1)
+                OR EXISTS (SELECT 1 FROM messages m WHERE m.room_id = r.id AND m.user_id = $1)
+              ) AS joined
+       FROM rooms r
+       WHERE r.type = 'public' AND (r.name ILIKE $2 OR COALESCE(r.description, '') ILIKE $2)
+       ORDER BY r.name
+       LIMIT 20`,
+      [req.user.id, pattern]
+    );
+    res.json(
+      result.rows.map((r) => ({
+        id: r.id,
+        name: r.name,
+        description: r.description,
+        type: 'public',
+        display_name: r.name,
+        joined: !!r.joined,
+        created_at: r.created_at,
+      }))
+    );
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Join a public channel
+app.post('/api/rooms/:roomId/join', authenticate, async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    const roomResult = await pool.query(
+      `SELECT id, name, description, type, created_at FROM rooms WHERE id = $1`,
+      [roomId]
+    );
+    const room = roomResult.rows[0];
+    if (!room || room.type !== 'public') {
+      return res.status(404).json({ error: 'Channel not found' });
+    }
+
+    await pool.query(
+      `INSERT INTO room_members (room_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+      [roomId, req.user.id]
+    );
+
+    res.json({
+      id: room.id,
+      name: room.name,
+      description: room.description,
+      type: 'public',
+      display_name: room.name,
+      created_at: room.created_at,
+    });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
   }
@@ -582,6 +685,73 @@ app.post('/api/chats/groups', authenticate, async (req, res) => {
   }
 });
 
+// List group members
+app.get('/api/chats/groups/:roomId/members', authenticate, async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    if (!(await isGroupMember(req.user.id, roomId))) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+    const result = await pool.query(
+      `SELECT u.id, u.username, u.surname, u.email, u.phone, u.avatar_color, u.avatar_url
+       FROM room_members rm
+       JOIN users u ON u.id = rm.user_id
+       WHERE rm.room_id = $1
+       ORDER BY u.username`,
+      [roomId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Add members to an existing group
+app.post('/api/chats/groups/:roomId/members', authenticate, async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    const { memberIds = [] } = req.body;
+    if (!(await isGroupMember(req.user.id, roomId))) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const existing = await pool.query(
+      'SELECT user_id FROM room_members WHERE room_id = $1',
+      [roomId]
+    );
+    const existingIds = new Set(existing.rows.map((r) => r.user_id));
+    const toAdd = [...new Set(memberIds.filter((id) => id && !existingIds.has(id)))];
+
+    if (toAdd.length === 0) {
+      return res.status(400).json({ error: 'No new members to add' });
+    }
+
+    for (const memberId of toAdd) {
+      const userCheck = await pool.query('SELECT id FROM users WHERE id = $1', [memberId]);
+      if (!userCheck.rows[0]) continue;
+      await pool.query(
+        `INSERT INTO room_members (room_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+        [roomId, memberId]
+      );
+    }
+
+    notifyRoomAdded(roomId, toAdd);
+
+    const countRes = await pool.query(
+      'SELECT COUNT(*)::int AS count FROM room_members WHERE room_id = $1',
+      [roomId]
+    );
+
+    res.json({
+      added: toAdd,
+      member_count: countRes.rows[0].count,
+    });
+  } catch (err) {
+    console.error('Add group members error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 const MESSAGE_PAGE_SIZE = 50;
 const MESSAGE_PAGE_MAX = 100;
 
@@ -641,6 +811,8 @@ app.post('/api/rooms/:roomId/upload', authenticate, (req, res) => {
           };
         }
       }
+
+      await ensureChannelMembership(req.user.id, roomId);
 
       const fileMime = resolveStoredMime(
         req.file.mimetype,
@@ -944,9 +1116,9 @@ async function joinSocketToUserRooms(socket) {
     socket.join(row.room_id);
   }
 
-  const publicRooms = await pool.query("SELECT id FROM rooms WHERE type = 'public'");
-  for (const row of publicRooms.rows) {
-    socket.join(row.id);
+  const publicRoomIds = await getParticipatedPublicRoomIds(userId);
+  for (const roomId of publicRoomIds) {
+    socket.join(roomId);
   }
 }
 
@@ -1004,6 +1176,8 @@ io.on('connection', async (socket) => {
         }
       }
 
+      await ensureChannelMembership(socket.user.id, roomId);
+
       const result = await pool.query(
         `INSERT INTO messages (room_id, user_id, content, reply_to_id)
          VALUES ($1, $2, $3, $4)
@@ -1046,6 +1220,52 @@ io.on('connection', async (socket) => {
       isTyping,
       roomId,
     });
+  });
+
+  socket.on('call_invite', async ({ toUserId, callId, callType, sdp }) => {
+    if (!toUserId || !callId || !sdp) return;
+    if (toUserId === socket.user.id) return;
+    const target = await pool.query('SELECT id, username FROM users WHERE id = $1', [toUserId]);
+    if (!target.rows[0]) return;
+    io.to(`user:${toUserId}`).emit('call_invite', {
+      callId,
+      callType: callType || 'audio',
+      sdp,
+      from: {
+        id: socket.user.id,
+        username: socket.user.username,
+        avatar_color: socket.user.avatar_color,
+        avatar_url: socket.user.avatar_url || null,
+      },
+    });
+  });
+
+  socket.on('call_answer', ({ toUserId, callId, sdp }) => {
+    if (!toUserId || !callId || !sdp) return;
+    io.to(`user:${toUserId}`).emit('call_answer', {
+      callId,
+      sdp,
+      fromUserId: socket.user.id,
+    });
+  });
+
+  socket.on('call_ice', ({ toUserId, callId, candidate }) => {
+    if (!toUserId || !callId || !candidate) return;
+    io.to(`user:${toUserId}`).emit('call_ice', {
+      callId,
+      candidate,
+      fromUserId: socket.user.id,
+    });
+  });
+
+  socket.on('call_reject', ({ toUserId, callId }) => {
+    if (!toUserId || !callId) return;
+    io.to(`user:${toUserId}`).emit('call_reject', { callId, fromUserId: socket.user.id });
+  });
+
+  socket.on('call_end', ({ toUserId, callId }) => {
+    if (!toUserId || !callId) return;
+    io.to(`user:${toUserId}`).emit('call_end', { callId, fromUserId: socket.user.id });
   });
 
   socket.on('disconnect', () => {

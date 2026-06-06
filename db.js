@@ -29,6 +29,7 @@ const initDB = async () => {
       ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_data TEXT;
       ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_mime VARCHAR(50);
       ALTER TABLE users ADD COLUMN IF NOT EXISTS bio VARCHAR(200);
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS chat_wallpaper VARCHAR(50) DEFAULT 'default';
 
       CREATE TABLE IF NOT EXISTS rooms (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

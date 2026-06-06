@@ -26,6 +26,7 @@ function formatUser(row) {
     bio: row.bio || null,
     avatar_color: row.avatar_color,
     avatar_url: row.avatar_url || null,
+    chat_wallpaper: row.chat_wallpaper || 'default',
   };
 }
 

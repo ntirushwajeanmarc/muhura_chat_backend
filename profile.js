@@ -12,6 +12,7 @@ const router = express.Router();
 
 const AVATAR_DIR = path.join(__dirname, 'uploads', 'avatars');
 const AVATAR_COLORS = ['#6366f1', '#ec4899', '#14b8a6', '#f59e0b', '#10b981', '#3b82f6', '#8b5cf6', '#ef4444', '#25d366'];
+const CHAT_WALLPAPERS = ['default', 'dark', 'teal', 'midnight', 'warm'];
 const MAX_AVATAR_SIZE = 3 * 1024 * 1024;
 
 if (!fs.existsSync(AVATAR_DIR)) {
@@ -37,6 +38,7 @@ function formatUser(row) {
     bio: row.bio || null,
     avatar_color: row.avatar_color,
     avatar_url: row.avatar_url || null,
+    chat_wallpaper: row.chat_wallpaper || 'default',
   };
   if (row.like_count !== undefined && row.like_count !== null) {
     user.like_count = parseInt(row.like_count, 10) || 0;
@@ -104,6 +106,7 @@ router.get('/me', authenticate, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT u.id, u.username, u.surname, u.email, u.phone, u.bio, u.avatar_color, u.avatar_url,
+              u.chat_wallpaper,
               (SELECT COUNT(*)::int FROM profile_likes pl WHERE pl.liked_user_id = u.id) AS like_count
        FROM users u WHERE u.id = $1`,
       [req.user.id]
@@ -187,7 +190,7 @@ router.post('/user/:userId/like', authenticate, async (req, res) => {
 
 router.patch('/', authenticate, async (req, res) => {
   try {
-    const { username, surname, phone, avatar_color, bio } = req.body;
+    const { username, surname, phone, avatar_color, bio, chat_wallpaper } = req.body;
     const updates = [];
     const values = [];
     let i = 1;
@@ -222,6 +225,13 @@ router.patch('/', authenticate, async (req, res) => {
       updates.push(`bio = $${i++}`);
       values.push(trimmed || null);
     }
+    if (chat_wallpaper !== undefined) {
+      if (!CHAT_WALLPAPERS.includes(chat_wallpaper)) {
+        return res.status(400).json({ error: 'Invalid wallpaper' });
+      }
+      updates.push(`chat_wallpaper = $${i++}`);
+      values.push(chat_wallpaper);
+    }
 
     if (updates.length === 0) {
       return res.status(400).json({ error: 'No fields to update' });
@@ -230,7 +240,7 @@ router.patch('/', authenticate, async (req, res) => {
     values.push(req.user.id);
     const result = await pool.query(
       `UPDATE users SET ${updates.join(', ')} WHERE id = $${i}
-       RETURNING id, username, surname, email, phone, bio, avatar_color, avatar_url`,
+       RETURNING id, username, surname, email, phone, bio, avatar_color, avatar_url, chat_wallpaper`,
       values
     );
     const user = formatUser(result.rows[0]);
@@ -305,4 +315,4 @@ router.delete('/avatar', authenticate, async (req, res) => {
   }
 });
 
-module.exports = { router, formatUser, issueToken, AVATAR_COLORS };
+module.exports = { router, formatUser, issueToken, AVATAR_COLORS, CHAT_WALLPAPERS };
