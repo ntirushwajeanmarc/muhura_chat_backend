@@ -1389,11 +1389,21 @@ function getOnlineUserIds() {
   return [...onlineConnectionCount.keys()];
 }
 
+async function sendPresenceSnapshot(socket) {
+  try {
+    const ids = await filterVisibleOnlineIds(socket.user.id, getOnlineUserIds());
+    socket.emit('presence_snapshot', { onlineUserIds: ids });
+  } catch {
+    socket.emit('presence_snapshot', { onlineUserIds: [] });
+  }
+}
+
 async function broadcastUserPresence(userId, online) {
   try {
     const audience = await getPresenceAudience(userId);
+    const payload = { userId: String(userId), online };
     audience.forEach((targetId) => {
-      io.to(`user:${targetId}`).emit('user_presence', { userId, online });
+      io.to(`user:${targetId}`).emit('user_presence', payload);
     });
   } catch (err) {
     console.error('Presence broadcast error:', err);
@@ -1444,10 +1454,12 @@ function notifyRoomAdded(roomId, userIds) {
 io.on('connection', async (socket) => {
   console.log(`🔌 ${socket.user.username} connected`);
   markUserConnected(socket.user.id);
-  filterVisibleOnlineIds(socket.user.id, getOnlineUserIds())
-    .then((ids) => socket.emit('presence_snapshot', { onlineUserIds: ids }))
-    .catch(() => socket.emit('presence_snapshot', { onlineUserIds: [] }));
   await joinSocketToUserRooms(socket);
+  sendPresenceSnapshot(socket);
+
+  socket.on('presence_sync', () => {
+    sendPresenceSnapshot(socket);
+  });
 
   // Join a room to receive messages (can join multiple rooms)
   socket.on('join_room', async (roomId) => {
