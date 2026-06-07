@@ -6,6 +6,7 @@ const { v4: uuidv4 } = require('uuid');
 const { pool } = require('./db');
 const { authenticate } = require('./auth');
 const { bufferToBase64 } = require('./fileStorage');
+const { notifyNewFollow } = require('./push');
 
 const router = express.Router();
 
@@ -103,6 +104,25 @@ router.post('/follow/:userId', authenticate, async (req, res) => {
         [req.user.id, userId]
       );
       following = true;
+
+      const followerRow = await pool.query(
+        'SELECT id, username, surname, avatar_color, avatar_url FROM users WHERE id = $1',
+        [req.user.id]
+      );
+      const follower = followerRow.rows[0];
+      if (follower) {
+        const io = req.app.get('io');
+        io?.to(`user:${userId}`).emit('new_follower', {
+          follower: {
+            id: follower.id,
+            username: follower.username,
+            surname: follower.surname || null,
+            avatar_color: follower.avatar_color,
+            avatar_url: follower.avatar_url || null,
+          },
+        });
+        notifyNewFollow(userId, follower).catch(() => {});
+      }
     }
 
     const counts = await pool.query(
@@ -119,6 +139,69 @@ router.post('/follow/:userId', authenticate, async (req, res) => {
       following_count: counts.rows[0].following_count,
     });
   } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+function mapFollowListUser(row) {
+  return {
+    id: row.id,
+    username: row.username,
+    surname: row.surname || null,
+    avatar_color: row.avatar_color,
+    avatar_url: row.avatar_url || null,
+    followed_by_me: !!row.followed_by_me,
+  };
+}
+
+router.get('/followers/:userId', authenticate, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const viewerId = req.user.id;
+    const userCheck = await pool.query('SELECT id FROM users WHERE id = $1', [userId]);
+    if (!userCheck.rows[0]) return res.status(404).json({ error: 'User not found' });
+
+    const result = await pool.query(
+      `SELECT u.id, u.username, u.surname, u.avatar_color, u.avatar_url,
+              EXISTS(
+                SELECT 1 FROM follows f
+                WHERE f.follower_id = $2 AND f.following_id = u.id
+              ) AS followed_by_me
+       FROM follows fo
+       JOIN users u ON u.id = fo.follower_id
+       WHERE fo.following_id = $1
+       ORDER BY fo.created_at DESC`,
+      [userId, viewerId]
+    );
+    res.json({ users: result.rows.map(mapFollowListUser) });
+  } catch (err) {
+    console.error('Followers list error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+router.get('/following/:userId', authenticate, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const viewerId = req.user.id;
+    const userCheck = await pool.query('SELECT id FROM users WHERE id = $1', [userId]);
+    if (!userCheck.rows[0]) return res.status(404).json({ error: 'User not found' });
+
+    const result = await pool.query(
+      `SELECT u.id, u.username, u.surname, u.avatar_color, u.avatar_url,
+              EXISTS(
+                SELECT 1 FROM follows f
+                WHERE f.follower_id = $2 AND f.following_id = u.id
+              ) AS followed_by_me
+       FROM follows fo
+       JOIN users u ON u.id = fo.following_id
+       WHERE fo.follower_id = $1
+       ORDER BY fo.created_at DESC`,
+      [userId, viewerId]
+    );
+    res.json({ users: result.rows.map(mapFollowListUser) });
+  } catch (err) {
+    console.error('Following list error:', err);
     res.status(500).json({ error: 'Server error' });
   }
 });

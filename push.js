@@ -119,6 +119,19 @@ async function notifyRoomMessage(msg, senderUserId) {
   );
 }
 
+async function notifyNewFollow(toUserId, follower) {
+  if (!toUserId || !follower?.username) return;
+
+  await sendToUser(toUserId, {
+    title: 'EganirA',
+    body: `${follower.username} started following you`,
+    type: 'follow',
+    fromUserId: follower.id,
+    url: '/',
+    silent: false,
+  });
+}
+
 async function notifyIncomingCall(toUserId, fromUser, callId, callType) {
   if (!toUserId || !callId) return;
 
@@ -215,4 +228,5 @@ module.exports = {
   isConfigured,
   notifyRoomMessage,
   notifyIncomingCall,
+  notifyNewFollow,
 };
