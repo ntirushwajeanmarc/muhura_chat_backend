@@ -51,6 +51,12 @@ function formatUser(row) {
   if (row.liked_by_me !== undefined) {
     user.liked_by_me = !!row.liked_by_me;
   }
+  if (row.follower_count !== undefined && row.follower_count !== null) {
+    user.follower_count = parseInt(row.follower_count, 10) || 0;
+  }
+  if (row.following_count !== undefined && row.following_count !== null) {
+    user.following_count = parseInt(row.following_count, 10) || 0;
+  }
   return user;
 }
 
@@ -112,7 +118,9 @@ router.get('/me', authenticate, async (req, res) => {
     const result = await pool.query(
       `SELECT u.id, u.username, u.surname, u.email, u.phone, u.bio, u.avatar_color, u.avatar_url,
               u.chat_wallpaper,
-              (SELECT COUNT(*)::int FROM profile_likes pl WHERE pl.liked_user_id = u.id) AS like_count
+              (SELECT COUNT(*)::int FROM profile_likes pl WHERE pl.liked_user_id = u.id) AS like_count,
+              (SELECT COUNT(*)::int FROM follows f WHERE f.following_id = u.id) AS follower_count,
+              (SELECT COUNT(*)::int FROM follows f2 WHERE f2.follower_id = u.id) AS following_count
        FROM users u WHERE u.id = $1`,
       [req.user.id]
     );

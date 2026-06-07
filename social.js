@@ -7,6 +7,7 @@ const { pool } = require('./db');
 const { authenticate } = require('./auth');
 const { bufferToBase64 } = require('./fileStorage');
 const { notifyNewFollow } = require('./push');
+const { viewerFollowsAuthor } = require('./followVisibility');
 
 const router = express.Router();
 
@@ -266,14 +267,8 @@ router.get('/stars/user/:userId', authenticate, async (req, res) => {
     const { userId } = req.params;
     const viewerId = req.user.id;
 
-    if (userId !== viewerId) {
-      const followCheck = await pool.query(
-        'SELECT 1 FROM follows WHERE follower_id = $1 AND following_id = $2',
-        [viewerId, userId]
-      );
-      if (followCheck.rows.length === 0) {
-        return res.status(403).json({ error: 'Follow this user to see their stars' });
-      }
+    if (!(await viewerFollowsAuthor(viewerId, userId))) {
+      return res.status(403).json({ error: 'Follow this user to see their stars' });
     }
 
     const userResult = await pool.query(

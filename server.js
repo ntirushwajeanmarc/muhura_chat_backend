@@ -19,6 +19,11 @@ const {
   notifyIncomingCall,
 } = require('./push');
 const { bufferToBase64, resolveStoredBytes } = require('./fileStorage');
+const {
+  getPresenceAudience,
+  filterVisibleOnlineIds,
+  viewerFollowsAuthor,
+} = require('./followVisibility');
 
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
@@ -378,14 +383,8 @@ app.get('/api/files', authenticate, async (req, res) => {
       }
       const viewerId = req.user.id;
       const authorId = row.rows[0].user_id;
-      if (authorId !== viewerId) {
-        const followCheck = await pool.query(
-          'SELECT 1 FROM follows WHERE follower_id = $1 AND following_id = $2',
-          [viewerId, authorId]
-        );
-        if (followCheck.rows.length === 0) {
-          return res.status(403).json({ error: 'Access denied' });
-        }
+      if (!(await viewerFollowsAuthor(viewerId, authorId))) {
+        return res.status(403).json({ error: 'Access denied' });
       }
       const bytes = resolveStoredBytes(row.rows[0], { dataKey: 'image_data' });
       res.type(row.rows[0].image_mime || 'image/jpeg');
@@ -1390,8 +1389,15 @@ function getOnlineUserIds() {
   return [...onlineConnectionCount.keys()];
 }
 
-function broadcastUserPresence(userId, online) {
-  io.emit('user_presence', { userId, online });
+async function broadcastUserPresence(userId, online) {
+  try {
+    const audience = await getPresenceAudience(userId);
+    audience.forEach((targetId) => {
+      io.to(`user:${targetId}`).emit('user_presence', { userId, online });
+    });
+  } catch (err) {
+    console.error('Presence broadcast error:', err);
+  }
 }
 
 function markUserConnected(userId) {
@@ -1438,7 +1444,9 @@ function notifyRoomAdded(roomId, userIds) {
 io.on('connection', async (socket) => {
   console.log(`🔌 ${socket.user.username} connected`);
   markUserConnected(socket.user.id);
-  socket.emit('presence_snapshot', { onlineUserIds: getOnlineUserIds() });
+  filterVisibleOnlineIds(socket.user.id, getOnlineUserIds())
+    .then((ids) => socket.emit('presence_snapshot', { onlineUserIds: ids }))
+    .catch(() => socket.emit('presence_snapshot', { onlineUserIds: [] }));
   await joinSocketToUserRooms(socket);
 
   // Join a room to receive messages (can join multiple rooms)
