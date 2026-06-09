@@ -130,6 +130,23 @@ function buildLiveMessage(row, socketUser, roomId, replyTo = null) {
   return msg;
 }
 
+async function shareDirectRoom(userIdA, userIdB) {
+  if (!userIdA || !userIdB || userIdA === userIdB) return false;
+  const result = await pool.query(
+    `SELECT r.id FROM rooms r
+     JOIN room_members rm1 ON r.id = rm1.room_id AND rm1.user_id = $1
+     JOIN room_members rm2 ON r.id = rm2.room_id AND rm2.user_id = $2
+     WHERE r.type = 'direct'
+     LIMIT 1`,
+    [userIdA, userIdB]
+  );
+  return !!result.rows[0];
+}
+
+async function canDirectCall(fromUserId, toUserId) {
+  return shareDirectRoom(fromUserId, toUserId);
+}
+
 async function canAccessRoom(userId, roomId) {
   const result = await pool.query(
     `SELECT r.type FROM rooms r WHERE r.id = $1`,
@@ -1484,8 +1501,14 @@ io.on('connection', async (socket) => {
   });
 
   socket.on('send_message', async ({ roomId, content, replyToId }) => {
-    if (!content?.trim()) return;
-    if (!(await canAccessRoom(socket.user.id, roomId))) return;
+    if (!content?.trim()) {
+      socket.emit('message_error', { roomId, error: 'Message cannot be empty' });
+      return;
+    }
+    if (!(await canAccessRoom(socket.user.id, roomId))) {
+      socket.emit('message_error', { roomId, error: 'You do not have access to this chat' });
+      return;
+    }
     try {
       let replyTo = null;
       if (replyToId) {
@@ -1517,6 +1540,7 @@ io.on('connection', async (socket) => {
       notifyRoomMessage(msg, socket.user.id).catch(() => {});
     } catch (err) {
       console.error('Message error:', err);
+      socket.emit('message_error', { roomId, error: 'Failed to send message' });
     }
   });
 
@@ -1554,6 +1578,10 @@ io.on('connection', async (socket) => {
   socket.on('call_invite', async ({ toUserId, callId, callType, sdp }) => {
     if (!toUserId || !callId || !sdp) return;
     if (toUserId === socket.user.id) return;
+    if (!(await canDirectCall(socket.user.id, toUserId))) {
+      socket.emit('call_error', { callId, error: 'You can only call users you have a direct chat with' });
+      return;
+    }
     const target = await pool.query(
       'SELECT id, username, avatar_color, avatar_url FROM users WHERE id = $1',
       [toUserId]
@@ -1588,13 +1616,15 @@ io.on('connection', async (socket) => {
     socket.emit('call_delivered', { callId, toUserId });
   });
 
-  socket.on('call_ringing', ({ toUserId, callId }) => {
+  socket.on('call_ringing', async ({ toUserId, callId }) => {
     if (!toUserId || !callId) return;
+    if (!(await canDirectCall(socket.user.id, toUserId))) return;
     io.to(`user:${toUserId}`).emit('call_ringing', { callId, fromUserId: socket.user.id });
   });
 
-  socket.on('call_answer', ({ toUserId, callId, sdp }) => {
+  socket.on('call_answer', async ({ toUserId, callId, sdp }) => {
     if (!toUserId || !callId || !sdp) return;
+    if (!(await canDirectCall(socket.user.id, toUserId))) return;
     io.to(`user:${toUserId}`).emit('call_answer', {
       callId,
       sdp,
@@ -1602,8 +1632,9 @@ io.on('connection', async (socket) => {
     });
   });
 
-  socket.on('call_ice', ({ toUserId, callId, candidate }) => {
+  socket.on('call_ice', async ({ toUserId, callId, candidate }) => {
     if (!toUserId || !callId || !candidate) return;
+    if (!(await canDirectCall(socket.user.id, toUserId))) return;
     io.to(`user:${toUserId}`).emit('call_ice', {
       callId,
       candidate,
@@ -1611,13 +1642,15 @@ io.on('connection', async (socket) => {
     });
   });
 
-  socket.on('call_reject', ({ toUserId, callId }) => {
+  socket.on('call_reject', async ({ toUserId, callId }) => {
     if (!toUserId || !callId) return;
+    if (!(await canDirectCall(socket.user.id, toUserId))) return;
     io.to(`user:${toUserId}`).emit('call_reject', { callId, fromUserId: socket.user.id });
   });
 
-  socket.on('call_end', ({ toUserId, callId }) => {
+  socket.on('call_end', async ({ toUserId, callId }) => {
     if (!toUserId || !callId) return;
+    if (!(await canDirectCall(socket.user.id, toUserId))) return;
     io.to(`user:${toUserId}`).emit('call_end', { callId, fromUserId: socket.user.id });
   });
 
