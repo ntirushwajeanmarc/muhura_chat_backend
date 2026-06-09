@@ -18,6 +18,7 @@ const {
   notifyRoomMessage,
   notifyIncomingCall,
 } = require('./push');
+const { router: gifsRouter, initGifRoutes } = require('./gifs');
 const { bufferToBase64, resolveStoredBytes } = require('./fileStorage');
 const {
   getPresenceAudience,
@@ -104,6 +105,14 @@ function formatMessageRow(row) {
       liked_by_me: !!row.liked_by_me,
     };
   }
+  if (row.message_type && row.message_type !== 'text') {
+    msg.message_type = row.message_type;
+  }
+  if (row.call_type) msg.call_type = row.call_type;
+  if (row.call_status) msg.call_status = row.call_status;
+  if (row.call_duration_secs != null) {
+    msg.call_duration_secs = parseInt(row.call_duration_secs, 10) || 0;
+  }
   return msg;
 }
 
@@ -126,12 +135,22 @@ function buildLiveMessage(row, socketUser, roomId, replyTo = null) {
       mime: row.attachment_mime,
     };
   }
+  if (row.message_type && row.message_type !== 'text') {
+    msg.message_type = row.message_type;
+  }
+  if (row.call_type) msg.call_type = row.call_type;
+  if (row.call_status) msg.call_status = row.call_status;
+  if (row.call_duration_secs != null) {
+    msg.call_duration_secs = parseInt(row.call_duration_secs, 10) || 0;
+  }
   msg.likes = { count: 0, liked_by_me: false };
   return msg;
 }
 
-async function shareDirectRoom(userIdA, userIdB) {
-  if (!userIdA || !userIdB || userIdA === userIdB) return false;
+const activeCalls = new Map();
+
+async function getDirectRoomId(userIdA, userIdB) {
+  if (!userIdA || !userIdB || userIdA === userIdB) return null;
   const result = await pool.query(
     `SELECT r.id FROM rooms r
      JOIN room_members rm1 ON r.id = rm1.room_id AND rm1.user_id = $1
@@ -140,7 +159,56 @@ async function shareDirectRoom(userIdA, userIdB) {
      LIMIT 1`,
     [userIdA, userIdB]
   );
-  return !!result.rows[0];
+  return result.rows[0]?.id || null;
+}
+
+async function shareDirectRoom(userIdA, userIdB) {
+  return !!(await getDirectRoomId(userIdA, userIdB));
+}
+
+async function recordCallMessage(callId, { status, durationSecs = null }) {
+  const call = activeCalls.get(callId);
+  if (!call || call.logged) return null;
+
+  const roomId = call.roomId || await getDirectRoomId(call.fromUserId, call.toUserId);
+  if (!roomId) return null;
+
+  call.logged = true;
+
+  const caller = await pool.query(
+    'SELECT id, username, avatar_color, avatar_url FROM users WHERE id = $1',
+    [call.fromUserId]
+  );
+  const user = caller.rows[0];
+  if (!user) return null;
+
+  const result = await pool.query(
+    `INSERT INTO messages (room_id, user_id, content, message_type, call_type, call_status, call_duration_secs)
+     VALUES ($1, $2, '', 'call', $3, $4, $5)
+     RETURNING id, content, created_at, message_type, call_type, call_status, call_duration_secs`,
+    [roomId, call.fromUserId, call.callType || 'audio', status, durationSecs]
+  );
+
+  const row = result.rows[0];
+  const msg = {
+    id: row.id,
+    content: '',
+    created_at: row.created_at,
+    user_id: user.id,
+    username: user.username,
+    avatar_color: user.avatar_color,
+    avatar_url: user.avatar_url || null,
+    room_id: roomId,
+    message_type: 'call',
+    call_type: row.call_type,
+    call_status: row.call_status,
+    call_duration_secs: row.call_duration_secs,
+    likes: { count: 0, liked_by_me: false },
+  };
+
+  io.to(roomId).emit('new_message', msg);
+  activeCalls.delete(callId);
+  return msg;
 }
 
 async function canDirectCall(fromUserId, toUserId) {
@@ -286,6 +354,16 @@ app.use('/api/auth', authRouter);
 app.use('/api/profile', profileRouter);
 app.use('/api/social', socialRouter);
 app.use('/api/push', pushRouter);
+app.use('/api/gifs', gifsRouter);
+
+initGifRoutes({
+  io,
+  canAccessRoom,
+  ensureChannelMembership,
+  buildLiveMessage,
+  formatMessageRow,
+  notifyRoomMessage,
+});
 
 function resolveUploadPath(urlPath) {
   const uploadRoot = path.resolve(UPLOAD_DIR);
@@ -964,6 +1042,7 @@ const MESSAGE_PAGE_MAX = 100;
 function messageSelectSql(viewerIdParam) {
   return `
   SELECT m.id, m.content, m.created_at, m.edited_at, m.reply_to_id,
+         m.message_type, m.call_type, m.call_status, m.call_duration_secs,
          m.attachment_url, m.attachment_name, m.attachment_mime,
          u.id AS user_id, u.username, u.avatar_color, u.avatar_url,
          ru.username AS reply_username,
@@ -1613,6 +1692,16 @@ io.on('connection', async (socket) => {
 
     notifyIncomingCall(toUserId, fromUser, callId, callType || 'audio').catch(() => {});
 
+    const roomId = await getDirectRoomId(socket.user.id, toUserId);
+    activeCalls.set(callId, {
+      fromUserId: socket.user.id,
+      toUserId,
+      callType: callType || 'audio',
+      roomId,
+      answeredAt: null,
+      logged: false,
+    });
+
     socket.emit('call_delivered', { callId, toUserId });
   });
 
@@ -1625,6 +1714,8 @@ io.on('connection', async (socket) => {
   socket.on('call_answer', async ({ toUserId, callId, sdp }) => {
     if (!toUserId || !callId || !sdp) return;
     if (!(await canDirectCall(socket.user.id, toUserId))) return;
+    const call = activeCalls.get(callId);
+    if (call) call.answeredAt = Date.now();
     io.to(`user:${toUserId}`).emit('call_answer', {
       callId,
       sdp,
@@ -1645,12 +1736,22 @@ io.on('connection', async (socket) => {
   socket.on('call_reject', async ({ toUserId, callId }) => {
     if (!toUserId || !callId) return;
     if (!(await canDirectCall(socket.user.id, toUserId))) return;
+    await recordCallMessage(callId, { status: 'declined' });
     io.to(`user:${toUserId}`).emit('call_reject', { callId, fromUserId: socket.user.id });
   });
 
   socket.on('call_end', async ({ toUserId, callId }) => {
     if (!toUserId || !callId) return;
     if (!(await canDirectCall(socket.user.id, toUserId))) return;
+    const call = activeCalls.get(callId);
+    if (call && !call.logged) {
+      if (call.answeredAt) {
+        const durationSecs = Math.max(1, Math.floor((Date.now() - call.answeredAt) / 1000));
+        await recordCallMessage(callId, { status: 'completed', durationSecs });
+      } else {
+        await recordCallMessage(callId, { status: 'missed' });
+      }
+    }
     io.to(`user:${toUserId}`).emit('call_end', { callId, fromUserId: socket.user.id });
   });
 

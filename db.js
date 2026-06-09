@@ -69,6 +69,10 @@ const initDB = async () => {
       ALTER TABLE messages ADD COLUMN IF NOT EXISTS attachment_mime VARCHAR(100);
       ALTER TABLE messages ADD COLUMN IF NOT EXISTS attachment_data TEXT;
       ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ;
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS message_type VARCHAR(20) DEFAULT 'text';
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS call_type VARCHAR(10);
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS call_status VARCHAR(20);
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS call_duration_secs INTEGER;
 
       CREATE INDEX IF NOT EXISTS idx_messages_room_created ON messages(room_id, created_at DESC);
 
