@@ -6,7 +6,8 @@ const { bufferToBase64 } = require('./fileStorage');
 const router = express.Router();
 
 const TENOR_BASE = 'https://tenor.googleapis.com/v2';
-const CLIENT_KEY = 'eganira';
+const GIPHY_BASE = 'https://api.giphy.com/v1/gifs';
+const TENOR_CLIENT_KEY = 'eganira';
 const MAX_GIF_BYTES = 8 * 1024 * 1024;
 
 let deps = null;
@@ -15,8 +16,35 @@ function initGifRoutes(dependencies) {
   deps = dependencies;
 }
 
-function getApiKey() {
+function getGiphyKey() {
+  return process.env.GIPHY_API_KEY?.trim() || null;
+}
+
+function getTenorKey() {
   return process.env.TENOR_API_KEY?.trim() || null;
+}
+
+function getGifProvider() {
+  if (getGiphyKey()) return 'giphy';
+  if (getTenorKey()) return 'tenor';
+  return null;
+}
+
+function mapGiphyResults(data) {
+  return (data?.data || []).map((item) => {
+    const images = item.images || {};
+    const gif = images.downsized || images.fixed_height || images.original;
+    const preview = images.preview_gif || images.fixed_width || images.fixed_height_small || gif;
+    if (!gif?.url) return null;
+    return {
+      id: item.id,
+      title: item.title || 'GIF',
+      previewUrl: preview?.url || gif.url,
+      gifUrl: gif.url,
+      width: parseInt(gif.width, 10) || null,
+      height: parseInt(gif.height, 10) || null,
+    };
+  }).filter(Boolean);
 }
 
 function mapTenorResults(data) {
@@ -37,13 +65,32 @@ function mapTenorResults(data) {
   }).filter(Boolean);
 }
 
+async function fetchGiphy(path, params) {
+  const key = getGiphyKey();
+  if (!key) return null;
+
+  const url = new URL(`${GIPHY_BASE}${path}`);
+  url.searchParams.set('api_key', key);
+  url.searchParams.set('rating', 'g');
+  Object.entries(params).forEach(([k, v]) => {
+    if (v != null && v !== '') url.searchParams.set(k, String(v));
+  });
+
+  const res = await fetch(url.toString());
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`Giphy API error ${res.status}: ${text.slice(0, 120)}`);
+  }
+  return res.json();
+}
+
 async function fetchTenor(path, params) {
-  const key = getApiKey();
+  const key = getTenorKey();
   if (!key) return null;
 
   const url = new URL(`${TENOR_BASE}${path}`);
   url.searchParams.set('key', key);
-  url.searchParams.set('client_key', CLIENT_KEY);
+  url.searchParams.set('client_key', TENOR_CLIENT_KEY);
   url.searchParams.set('media_filter', 'gif,tinygif,mediumgif');
   Object.entries(params).forEach(([k, v]) => {
     if (v != null && v !== '') url.searchParams.set(k, String(v));
@@ -57,26 +104,45 @@ async function fetchTenor(path, params) {
   return res.json();
 }
 
+function isGifBuffer(buffer) {
+  return buffer.length >= 6
+    && buffer[0] === 0x47
+    && buffer[1] === 0x49
+    && buffer[2] === 0x46;
+}
+
 router.get('/search', authenticate, async (req, res) => {
   try {
-    if (!getApiKey()) {
+    const provider = getGifProvider();
+    if (!provider) {
       return res.status(503).json({
-        error: 'GIF search is not configured. Set TENOR_API_KEY on the server.',
+        error: 'GIF search is not configured. Set GIPHY_API_KEY (easy — developers.giphy.com) or paste a GIF link in the app.',
         gifs: [],
+        provider: null,
+        pasteSupported: true,
       });
     }
 
     const q = (req.query.q || '').trim();
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 30);
 
-    const data = q
-      ? await fetchTenor('/search', { q, limit, contentfilter: 'high' })
-      : await fetchTenor('/featured', { limit, contentfilter: 'high' });
+    let gifs = [];
+    if (provider === 'giphy') {
+      const data = q
+        ? await fetchGiphy('/search', { q, limit })
+        : await fetchGiphy('/trending', { limit });
+      gifs = mapGiphyResults(data);
+    } else {
+      const data = q
+        ? await fetchTenor('/search', { q, limit, contentfilter: 'high' })
+        : await fetchTenor('/featured', { limit, contentfilter: 'high' });
+      gifs = mapTenorResults(data);
+    }
 
-    res.json({ gifs: mapTenorResults(data) });
+    res.json({ gifs, provider, pasteSupported: true });
   } catch (err) {
     console.error('GIF search error:', err.message);
-    res.status(500).json({ error: 'Could not load GIFs', gifs: [] });
+    res.status(500).json({ error: 'Could not load GIFs', gifs: [], pasteSupported: true });
   }
 });
 
@@ -103,14 +169,11 @@ router.post('/send', authenticate, async (req, res) => {
   }
 
   try {
-    const gifRes = await fetch(gifUrl);
+    const gifRes = await fetch(gifUrl, {
+      headers: { 'User-Agent': 'EganirA/1.0' },
+    });
     if (!gifRes.ok) {
-      return res.status(400).json({ error: 'Could not download GIF' });
-    }
-
-    const contentType = (gifRes.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
-    if (contentType && !contentType.includes('gif') && contentType !== 'image/webp') {
-      return res.status(400).json({ error: 'URL is not a GIF image' });
+      return res.status(400).json({ error: 'Could not download GIF — use a direct image link' });
     }
 
     const buffer = Buffer.from(await gifRes.arrayBuffer());
@@ -119,6 +182,11 @@ router.post('/send', authenticate, async (req, res) => {
     }
     if (buffer.length < 100) {
       return res.status(400).json({ error: 'GIF file is too small or empty' });
+    }
+    if (!isGifBuffer(buffer)) {
+      return res.status(400).json({
+        error: 'URL is not a GIF image — copy the direct link (e.g. media.giphy.com/.../giphy.gif)',
+      });
     }
 
     let replyTo = null;
