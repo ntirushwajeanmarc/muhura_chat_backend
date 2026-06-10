@@ -63,16 +63,17 @@ async function requestPasswordReset(email) {
 
   const resetUrl = `${getAppUrl()}/?reset_token=${rawToken}`;
 
-  try {
-    await sendPasswordResetEmail({
-      to: user.email,
-      username: user.username,
-      resetUrl,
+  // Respond to the client immediately — do not block on SMTP (Hostinger can be slow/hang).
+  const emailPayload = {
+    to: user.email,
+    username: user.username,
+    resetUrl,
+  };
+  setImmediate(() => {
+    sendPasswordResetEmail(emailPayload).catch((err) => {
+      console.error('Password reset email error:', err.message);
     });
-  } catch (err) {
-    console.error('Password reset email error:', err.message);
-    return { ok: false, status: 500, error: 'Could not send reset email. Try again later.' };
-  }
+  });
 
   return generic;
 }
