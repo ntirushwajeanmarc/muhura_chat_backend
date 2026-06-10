@@ -170,8 +170,10 @@ function logSmtpFailure(err) {
     console.error('   IPv6 route unavailable — using IPv4 lookup + family: 4.');
   }
   if (msg.includes('timeout') || msg.includes('timed out') || err.code === 'ETIMEDOUT') {
-    console.error('   Hostinger SMTP is strict on timing — DNS + TLS must finish quickly.');
-    console.error('   Retries are enabled; if all attempts fail, check Render SMTP egress or try SMTP_PORT=587 SMTP_SECURE=false.');
+    console.error('   All retry attempts timed out — TCP to the SMTP port never opened.');
+    console.error('   HTTP/WebSocket work but SMTP does not → Render free tier blocks outbound ports 465/587.');
+    console.error('   Fix: upgrade to a paid Render instance, or host the API on Hostinger/VPS where SMTP works.');
+    console.error('   Quick test: set SMTP_PORT=587 SMTP_SECURE=false — if it still times out, egress is blocked.');
   }
 }
 
