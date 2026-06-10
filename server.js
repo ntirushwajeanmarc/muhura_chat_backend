@@ -29,6 +29,7 @@ const {
 
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
+const MAX_GROUP_AVATAR_SIZE = 3 * 1024 * 1024;
 const ALLOWED_MIMES = new Set([
   'image/jpeg', 'image/png', 'image/gif', 'image/webp',
   'application/pdf',
@@ -60,6 +61,24 @@ const upload = multer({
       cb(null, true);
     } else {
       cb(new Error('File type not allowed'));
+    }
+  },
+});
+
+const groupAvatarUpload = multer({
+  storage: multer.diskStorage({
+    destination: UPLOAD_DIR,
+    filename: (_req, file, cb) => {
+      const ext = path.extname(file.originalname).toLowerCase() || '.jpg';
+      cb(null, `group-${uuidv4()}${ext}`);
+    },
+  }),
+  limits: { fileSize: MAX_GROUP_AVATAR_SIZE },
+  fileFilter: (_req, file, cb) => {
+    if (['image/jpeg', 'image/png', 'image/gif', 'image/webp'].includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only image files are allowed for group photo'));
     }
   },
 });
@@ -244,6 +263,16 @@ async function isGroupMember(userId, roomId) {
   return result.rows.length > 0;
 }
 
+async function isGroupAdmin(userId, roomId) {
+  const result = await pool.query(
+    `SELECT 1 FROM rooms r
+     JOIN room_members rm ON rm.room_id = r.id AND rm.user_id = $2
+     WHERE r.id = $1 AND r.type = 'group' AND rm.role = 'admin'`,
+    [roomId, userId]
+  );
+  return result.rows.length > 0;
+}
+
 async function ensureChannelMembership(userId, roomId) {
   const room = await pool.query('SELECT type FROM rooms WHERE id = $1', [roomId]);
   if (room.rows[0]?.type !== 'public') return;
@@ -302,6 +331,9 @@ async function formatRoomRow(row, currentUserId) {
   } else if (row.type === 'group') {
     room.display_name = row.name;
     if (row.member_count) room.member_count = parseInt(row.member_count, 10);
+    room.avatar_url = row.avatar_url || null;
+    room.avatar_color = row.avatar_color || '#00a884';
+    if (row.my_role) room.my_role = row.my_role;
   } else {
     room.display_name = row.name;
   }
@@ -449,6 +481,24 @@ app.get('/api/files', authenticate, async (req, res) => {
       } else {
         res.setHeader('Content-Disposition', 'inline');
       }
+      return res.send(bytes);
+    }
+
+    if (urlPath.startsWith('/avatars/group/')) {
+      const roomId = urlPath.slice('/avatars/group/'.length).split('/')[0];
+      if (!roomId) return res.status(400).json({ error: 'Invalid path' });
+      if (!(await isGroupMember(req.user.id, roomId))) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
+      const avatar = await pool.query(
+        `SELECT avatar_data, avatar_mime FROM rooms
+         WHERE id = $1 AND type = 'group' AND avatar_data IS NOT NULL`,
+        [roomId]
+      );
+      const bytes = resolveStoredBytes(avatar.rows[0], { dataKey: 'avatar_data' });
+      if (!bytes) return res.status(404).json({ error: 'Group avatar not found' });
+      res.type(avatar.rows[0].avatar_mime || 'image/jpeg');
+      res.setHeader('Content-Disposition', 'inline');
       return res.send(bytes);
     }
 
@@ -822,6 +872,8 @@ app.get('/api/chats', authenticate, async (req, res) => {
 
     const groupResult = await pool.query(
       `SELECT r.id, r.name, r.description, r.type, r.created_by, r.created_at,
+              r.avatar_url, r.avatar_color,
+              rm.role AS my_role,
               (SELECT COUNT(*) FROM room_members WHERE room_id = r.id) AS member_count,
               lm.content AS last_message, lm.created_at AS last_message_at,
               ${unreadCountSql('$1')} AS unread_count
@@ -948,9 +1000,10 @@ app.post('/api/chats/groups', authenticate, async (req, res) => {
       const roomId = room.rows[0].id;
       const allMembers = [userId, ...uniqueMembers];
       for (const memberId of allMembers) {
+        const role = memberId === userId ? 'admin' : 'member';
         await client.query(
-          `INSERT INTO room_members (room_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
-          [roomId, memberId]
+          `INSERT INTO room_members (room_id, user_id, role) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+          [roomId, memberId, role]
         );
       }
       await client.query('COMMIT');
@@ -962,6 +1015,9 @@ app.post('/api/chats/groups', authenticate, async (req, res) => {
         type: 'group',
         display_name: groupName,
         member_count: allMembers.length,
+        my_role: 'admin',
+        avatar_url: null,
+        avatar_color: '#00a884',
         created_at: room.rows[0].created_at,
       });
     } catch (err) {
@@ -984,11 +1040,11 @@ app.get('/api/chats/groups/:roomId/members', authenticate, async (req, res) => {
       return res.status(403).json({ error: 'Access denied' });
     }
     const result = await pool.query(
-      `SELECT u.id, u.username, u.surname, u.email, u.phone, u.avatar_color, u.avatar_url
+      `SELECT u.id, u.username, u.surname, u.avatar_color, u.avatar_url, rm.role
        FROM room_members rm
        JOIN users u ON u.id = rm.user_id
        WHERE rm.room_id = $1
-       ORDER BY u.username`,
+       ORDER BY rm.role = 'admin' DESC, u.username`,
       [roomId]
     );
     res.json(result.rows);
@@ -1002,8 +1058,8 @@ app.post('/api/chats/groups/:roomId/members', authenticate, async (req, res) => 
   try {
     const { roomId } = req.params;
     const { memberIds = [] } = req.body;
-    if (!(await isGroupMember(req.user.id, roomId))) {
-      return res.status(403).json({ error: 'Access denied' });
+    if (!(await isGroupAdmin(req.user.id, roomId))) {
+      return res.status(403).json({ error: 'Only group admins can add members' });
     }
 
     const existing = await pool.query(
@@ -1021,7 +1077,7 @@ app.post('/api/chats/groups/:roomId/members', authenticate, async (req, res) => 
       const userCheck = await pool.query('SELECT id FROM users WHERE id = $1', [memberId]);
       if (!userCheck.rows[0]) continue;
       await pool.query(
-        `INSERT INTO room_members (room_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+        `INSERT INTO room_members (room_id, user_id, role) VALUES ($1, $2, 'member') ON CONFLICT DO NOTHING`,
         [roomId, memberId]
       );
     }
@@ -1041,6 +1097,53 @@ app.post('/api/chats/groups/:roomId/members', authenticate, async (req, res) => 
     console.error('Add group members error:', err);
     res.status(500).json({ error: 'Server error' });
   }
+});
+
+app.post('/api/chats/groups/:roomId/avatar', authenticate, (req, res) => {
+  const { roomId } = req.params;
+  groupAvatarUpload.single('photo')(req, res, async (err) => {
+    if (err) {
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        return res.status(400).json({ error: 'Photo too large (max 3 MB)' });
+      }
+      return res.status(400).json({ error: err.message || 'Upload failed' });
+    }
+    if (!req.file) return res.status(400).json({ error: 'No photo provided' });
+
+    try {
+      if (!(await isGroupAdmin(req.user.id, roomId))) {
+        fs.unlink(req.file.path, () => {});
+        return res.status(403).json({ error: 'Only group admins can change the group photo' });
+      }
+
+      const base64 = bufferToBase64(fs.readFileSync(req.file.path));
+      const mime = req.file.mimetype || 'image/jpeg';
+      const avatarUrl = `/avatars/group/${roomId}`;
+
+      const result = await pool.query(
+        `UPDATE rooms SET avatar_url = $1, avatar_data = $2, avatar_mime = $3
+         WHERE id = $4 AND type = 'group'
+         RETURNING id, name, avatar_url, avatar_color`,
+        [avatarUrl, base64, mime, roomId]
+      );
+      fs.unlink(req.file.path, () => {});
+
+      if (!result.rows[0]) {
+        return res.status(404).json({ error: 'Group not found' });
+      }
+
+      res.json({
+        id: result.rows[0].id,
+        name: result.rows[0].name,
+        avatar_url: result.rows[0].avatar_url,
+        avatar_color: result.rows[0].avatar_color || '#00a884',
+      });
+    } catch (uploadErr) {
+      fs.unlink(req.file.path, () => {});
+      console.error('Group avatar upload error:', uploadErr);
+      res.status(500).json({ error: 'Server error' });
+    }
+  });
 });
 
 const MESSAGE_PAGE_SIZE = 50;

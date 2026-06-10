@@ -44,6 +44,10 @@ const initDB = async () => {
 
       ALTER TABLE rooms ADD COLUMN IF NOT EXISTS type VARCHAR(20) DEFAULT 'public';
       ALTER TABLE rooms ALTER COLUMN name DROP NOT NULL;
+      ALTER TABLE rooms ADD COLUMN IF NOT EXISTS avatar_url VARCHAR(500);
+      ALTER TABLE rooms ADD COLUMN IF NOT EXISTS avatar_data TEXT;
+      ALTER TABLE rooms ADD COLUMN IF NOT EXISTS avatar_mime VARCHAR(50);
+      ALTER TABLE rooms ADD COLUMN IF NOT EXISTS avatar_color VARCHAR(7) DEFAULT '#00a884';
 
       CREATE TABLE IF NOT EXISTS room_members (
         room_id UUID REFERENCES rooms(id) ON DELETE CASCADE,
@@ -51,6 +55,8 @@ const initDB = async () => {
         joined_at TIMESTAMPTZ DEFAULT NOW(),
         PRIMARY KEY (room_id, user_id)
       );
+
+      ALTER TABLE room_members ADD COLUMN IF NOT EXISTS role VARCHAR(20) DEFAULT 'member';
 
       CREATE INDEX IF NOT EXISTS idx_room_members_user ON room_members(user_id);
 
@@ -197,6 +203,16 @@ const initDB = async () => {
     `);
 
     await client.query(`UPDATE rooms SET type = 'public' WHERE type IS NULL`);
+
+    await client.query(`
+      UPDATE room_members rm
+      SET role = 'admin'
+      FROM rooms r
+      WHERE rm.room_id = r.id
+        AND rm.user_id = r.created_by
+        AND r.type = 'group'
+        AND COALESCE(rm.role, 'member') <> 'admin'
+    `);
 
     await client.query(`DROP INDEX IF EXISTS idx_rooms_name_unique`);
     await client.query(`
