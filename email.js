@@ -99,8 +99,14 @@ async function verifySmtpConnection() {
     return true;
   } catch (err) {
     console.error('❌ SMTP verification failed:', err.message);
-    if (err.message?.includes('ENETUNREACH') && err.message?.includes(':')) {
+    const msg = String(err.message || '').toLowerCase();
+    if (msg.includes('enetunreach')) {
       console.error('   IPv6 route unavailable — connection forced to IPv4 (family: 4). Redeploy if this persists.');
+    }
+    if (msg.includes('timeout') || msg.includes('timed out') || err.code === 'ETIMEDOUT') {
+      console.error('   Outbound SMTP to ports 465/587 is often blocked on free PaaS hosts (e.g. Render free tier).');
+      console.error('   Your config looks correct — upgrade to a paid Render instance, or run the API on Hostinger/VPS where SMTP works.');
+      console.error('   HTTP PORT and SMTP_PORT are unrelated; this is not a port mix-up.');
     }
     return false;
   }
