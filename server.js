@@ -389,6 +389,16 @@ app.use(express.json());
 // Routes
 configureVapid();
 
+const { smtpConfigured, getAppUrl } = require('./email');
+
+app.get('/api/health', (_req, res) => {
+  res.json({
+    ok: true,
+    smtp_configured: smtpConfigured(),
+    reset_link_base: getAppUrl(),
+  });
+});
+
 app.use('/api/auth', authRouter);
 app.use('/api/profile', profileRouter);
 app.use('/api/social', socialRouter);
