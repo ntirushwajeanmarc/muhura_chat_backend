@@ -34,11 +34,48 @@ function getTransporter() {
   return transporter;
 }
 
+function getSmtpUser() {
+  return process.env.SMTP_USER?.trim() || '';
+}
+
 function getFromAddress() {
+  const user = getSmtpUser();
   const from = process.env.SMTP_FROM?.trim();
-  if (from) return from;
-  const user = process.env.SMTP_USER?.trim();
+  if (from) {
+    const match = from.match(/<([^>]+)>/);
+    const fromEmail = (match ? match[1] : from).trim().toLowerCase();
+    if (user && fromEmail !== user.toLowerCase()) {
+      console.warn(
+        `SMTP_FROM (${fromEmail}) should match SMTP_USER (${user}) on Hostinger — using SMTP_USER as sender`
+      );
+      return `"EganirA" <${user}>`;
+    }
+    return from;
+  }
   return user ? `"EganirA" <${user}>` : '"EganirA" <noreply@localhost>';
+}
+
+async function verifySmtpConnection() {
+  if (!smtpConfigured()) {
+    console.warn(
+      '⚠️  SMTP not configured — password reset emails will NOT send. Set SMTP_HOST, SMTP_USER, SMTP_PASS (and APP_URL) in server environment.'
+    );
+    return false;
+  }
+
+  try {
+    const transport = getTransporter();
+    await transport.verify();
+    const port = parseInt(process.env.SMTP_PORT, 10) || 465;
+    console.log(`✅ SMTP verified (${process.env.SMTP_HOST}:${port} as ${getSmtpUser()})`);
+    return true;
+  } catch (err) {
+    console.error('❌ SMTP verification failed:', err.message);
+    if (parseInt(process.env.SMTP_PORT, 10) === 465) {
+      console.error('   Tip: try SMTP_PORT=587 and SMTP_SECURE=false if port 465 is blocked.');
+    }
+    return false;
+  }
 }
 
 function getAppUrl() {
@@ -83,18 +120,28 @@ async function sendPasswordResetEmail({ to, username, resetUrl }) {
     </div>
   `;
 
-  await transport.sendMail({
+  const smtpUser = getSmtpUser();
+  const info = await transport.sendMail({
     from: getFromAddress(),
     to,
-    replyTo: process.env.SMTP_REPLY_TO || process.env.SMTP_USER,
+    replyTo: process.env.SMTP_REPLY_TO || smtpUser,
+    envelope: {
+      from: smtpUser || getFromAddress(),
+      to,
+    },
     subject,
     text,
     html,
   });
+
+  console.log(`📧 Password reset sent to ${to} (messageId: ${info.messageId || 'n/a'})`);
+  return info;
 }
 
 module.exports = {
   smtpConfigured,
   getAppUrl,
+  getSmtpUser,
+  verifySmtpConnection,
   sendPasswordResetEmail,
 };

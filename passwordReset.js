@@ -71,7 +71,8 @@ async function requestPasswordReset(email) {
   };
   setImmediate(() => {
     sendPasswordResetEmail(emailPayload).catch((err) => {
-      console.error('Password reset email error:', err.message);
+      console.error('Password reset email FAILED:', err.message);
+      if (err.response) console.error('SMTP response:', err.response);
     });
   });
 
