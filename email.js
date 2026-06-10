@@ -45,6 +45,8 @@ function getTransporter() {
     host: env('SMTP_HOST'),
     port,
     secure,
+    // Render/cloud often has no IPv6 route — Hostinger resolves to IPv6 and fails with ENETUNREACH
+    family: 4,
     auth: {
       user: env('SMTP_USER'),
       pass: getSmtpPass(),
@@ -82,9 +84,8 @@ function logSmtpConfig() {
     console.warn('⚠️  SMTP not configured — set SMTP_HOST, SMTP_USER, SMTP_PASS in environment');
     return;
   }
-  console.log(
-    `📬 SMTP from environment: ${cfg.host}:${cfg.port} secure=${cfg.secure} user=${cfg.user} (HTTP PORT=${cfg.http_port})`
-  );
+  console.log(`📬 SMTP mail server: ${cfg.host}:${cfg.port} secure=${cfg.secure} user=${cfg.user} (IPv4)`);
+  console.log(`🌐 HTTP web server will use PORT=${cfg.http_port} (separate from SMTP_PORT)`);
 }
 
 async function verifySmtpConnection() {
@@ -98,6 +99,9 @@ async function verifySmtpConnection() {
     return true;
   } catch (err) {
     console.error('❌ SMTP verification failed:', err.message);
+    if (err.message?.includes('ENETUNREACH') && err.message?.includes(':')) {
+      console.error('   IPv6 route unavailable — connection forced to IPv4 (family: 4). Redeploy if this persists.');
+    }
     return false;
   }
 }

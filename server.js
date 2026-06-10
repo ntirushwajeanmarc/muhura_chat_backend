@@ -1938,7 +1938,7 @@ const PORT = process.env.PORT || 4000;
 
 initDB().then(async () => {
   await verifySmtpConnection();
-  server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+  server.listen(PORT, () => console.log(`🚀 HTTP server listening on port ${PORT}`));
 }).catch(err => {
   console.error('Failed to init DB:', err);
   process.exit(1);
