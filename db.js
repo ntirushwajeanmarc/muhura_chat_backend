@@ -126,9 +126,12 @@ const initDB = async () => {
         content TEXT,
         image_data TEXT,
         image_mime VARCHAR(50),
+        background_color VARCHAR(30),
         created_at TIMESTAMPTZ DEFAULT NOW(),
         expires_at TIMESTAMPTZ DEFAULT NOW() + INTERVAL '24 hours'
       );
+
+      ALTER TABLE stars ADD COLUMN IF NOT EXISTS background_color VARCHAR(30);
 
       CREATE INDEX IF NOT EXISTS idx_stars_user_created ON stars(user_id, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_stars_expires ON stars(expires_at);

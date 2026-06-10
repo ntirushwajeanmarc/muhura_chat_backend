@@ -8,6 +8,7 @@ function formatStarReplyRow(row) {
     user_id: row.star_reply_user_id,
     username: row.star_reply_username,
     content: row.star_reply_content || null,
+    background_color: row.star_reply_background_color || null,
     image_url: row.star_reply_has_image ? `/stars/db/${row.star_reply_id}` : null,
     image_mime: row.star_reply_image_mime || null,
   };
@@ -15,7 +16,7 @@ function formatStarReplyRow(row) {
 
 async function resolveStarReply(starId, senderId) {
   const result = await pool.query(
-    `SELECT s.id, s.user_id, s.content, s.image_mime,
+    `SELECT s.id, s.user_id, s.content, s.background_color, s.image_mime,
             CASE WHEN s.image_data IS NOT NULL THEN true ELSE false END AS has_image,
             u.username
      FROM stars s
@@ -36,6 +37,7 @@ async function resolveStarReply(starId, senderId) {
       user_id: row.user_id,
       username: row.username,
       content: row.content || null,
+      background_color: row.background_color || null,
       image_url: row.has_image ? `/stars/db/${row.id}` : null,
       image_mime: row.image_mime || null,
     },

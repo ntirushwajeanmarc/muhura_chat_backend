@@ -8,6 +8,10 @@ const { authenticate } = require('./auth');
 const { bufferToBase64 } = require('./fileStorage');
 const { notifyNewFollow } = require('./push');
 const { viewerFollowsAuthor } = require('./followVisibility');
+const {
+  DEFAULT_STAR_BACKGROUND,
+  isValidStarBackground,
+} = require('./starBackgrounds');
 
 const router = express.Router();
 
@@ -40,6 +44,7 @@ function formatStarRow(row) {
     id: row.id,
     user_id: row.user_id,
     content: row.content || null,
+    background_color: row.background_color || null,
     created_at: row.created_at,
     expires_at: row.expires_at,
   };
@@ -224,7 +229,7 @@ router.get('/stars/feed', authenticate, async (req, res) => {
     const feed = [];
     for (const userRow of usersResult.rows) {
       const starsResult = await pool.query(
-        `SELECT id, user_id, content, image_mime, created_at, expires_at,
+        `SELECT id, user_id, content, background_color, image_mime, created_at, expires_at,
                 CASE WHEN image_data IS NOT NULL THEN true ELSE false END AS has_image
          FROM stars
          WHERE user_id = $1 AND expires_at > NOW()
@@ -247,6 +252,7 @@ router.get('/stars/feed', authenticate, async (req, res) => {
           id: s.id,
           user_id: s.user_id,
           content: s.content || null,
+          background_color: s.background_color || null,
           image_url: s.has_image ? `/stars/db/${s.id}` : null,
           image_mime: s.image_mime || null,
           created_at: s.created_at,
@@ -278,7 +284,7 @@ router.get('/stars/user/:userId', authenticate, async (req, res) => {
     if (!userResult.rows[0]) return res.status(404).json({ error: 'User not found' });
 
     const starsResult = await pool.query(
-      `SELECT id, user_id, content, image_mime, created_at, expires_at,
+      `SELECT id, user_id, content, background_color, image_mime, created_at, expires_at,
               CASE WHEN image_data IS NOT NULL THEN true ELSE false END AS has_image
        FROM stars
        WHERE user_id = $1 AND expires_at > NOW()
@@ -292,6 +298,7 @@ router.get('/stars/user/:userId', authenticate, async (req, res) => {
         id: s.id,
         user_id: s.user_id,
         content: s.content || null,
+        background_color: s.background_color || null,
         image_url: s.has_image ? `/stars/db/${s.id}` : null,
         image_mime: s.image_mime || null,
         created_at: s.created_at,
@@ -315,10 +322,16 @@ router.post('/stars', authenticate, (req, res) => {
     try {
       const content = (req.body.content || '').trim().slice(0, 500);
       const hasImage = !!req.file;
+      const requestedBg = (req.body.background_color || '').trim();
 
       if (!content && !hasImage) {
         if (req.file) fs.unlink(req.file.path, () => {});
         return res.status(400).json({ error: 'Add text or an image for your star' });
+      }
+
+      let backgroundColor = null;
+      if (!hasImage && content) {
+        backgroundColor = isValidStarBackground(requestedBg) ? requestedBg : DEFAULT_STAR_BACKGROUND;
       }
 
       let imageData = null;
@@ -330,10 +343,10 @@ router.post('/stars', authenticate, (req, res) => {
       }
 
       const result = await pool.query(
-        `INSERT INTO stars (user_id, content, image_data, image_mime, expires_at)
-         VALUES ($1, $2, $3, $4, NOW() + INTERVAL '24 hours')
-         RETURNING id, user_id, content, image_mime, created_at, expires_at`,
-        [req.user.id, content || null, imageData, imageMime]
+        `INSERT INTO stars (user_id, content, image_data, image_mime, background_color, expires_at)
+         VALUES ($1, $2, $3, $4, $5, NOW() + INTERVAL '24 hours')
+         RETURNING id, user_id, content, image_mime, background_color, created_at, expires_at`,
+        [req.user.id, content || null, imageData, imageMime, backgroundColor]
       );
 
       const row = result.rows[0];
@@ -341,6 +354,7 @@ router.post('/stars', authenticate, (req, res) => {
         id: row.id,
         user_id: row.user_id,
         content: row.content,
+        background_color: row.background_color,
         image_url: imageData ? `/stars/db/${row.id}` : null,
         image_mime: row.image_mime,
         created_at: row.created_at,

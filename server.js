@@ -1159,6 +1159,7 @@ function messageSelectSql(viewerIdParam) {
          ru.username AS reply_username,
          rm.content AS reply_content,
          sr.content AS star_reply_content,
+         sr.background_color AS star_reply_background_color,
          sr.image_mime AS star_reply_image_mime,
          (sr.image_data IS NOT NULL) AS star_reply_has_image,
          su.username AS star_reply_username,
