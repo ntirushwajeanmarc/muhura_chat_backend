@@ -1,4 +1,7 @@
-require('dotenv').config();
+// Production (Render): use hosting environment only. Local dev: load backend/.env
+if (process.env.NODE_ENV !== 'production') {
+  require('dotenv').config();
+}
 const express = require('express');
 const http = require('http');
 const path = require('path');
@@ -389,12 +392,17 @@ app.use(express.json());
 // Routes
 configureVapid();
 
-const { smtpConfigured, getAppUrl } = require('./email');
+const { smtpConfigured, getAppUrl, getSmtpConfigForLog } = require('./email');
 
 app.get('/api/health', (_req, res) => {
+  const smtp = getSmtpConfigForLog();
   res.json({
     ok: true,
     smtp_configured: smtpConfigured(),
+    smtp_host: smtp.host,
+    smtp_port: smtp.port,
+    smtp_secure: smtp.secure,
+    smtp_user: smtp.user,
     reset_link_base: getAppUrl(),
   });
 });

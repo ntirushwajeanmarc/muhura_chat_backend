@@ -2,86 +2,110 @@ const nodemailer = require('nodemailer');
 
 let transporter = null;
 
+function env(key) {
+  return (process.env[key] || '').trim();
+}
+
+/** Strip accidental quotes if password was pasted with '...' in hosting UI */
+function getSmtpPass() {
+  const pass = process.env.SMTP_PASS || '';
+  if (
+    (pass.startsWith("'") && pass.endsWith("'"))
+    || (pass.startsWith('"') && pass.endsWith('"'))
+  ) {
+    return pass.slice(1, -1);
+  }
+  return pass;
+}
+
 function smtpConfigured() {
-  return Boolean(
-    process.env.SMTP_HOST
-    && process.env.SMTP_USER
-    && process.env.SMTP_PASS
-  );
+  return Boolean(env('SMTP_HOST') && env('SMTP_USER') && getSmtpPass());
+}
+
+function getSmtpPort() {
+  const parsed = parseInt(env('SMTP_PORT'), 10);
+  return Number.isFinite(parsed) ? parsed : 465;
+}
+
+function getSmtpSecure() {
+  const value = env('SMTP_SECURE').toLowerCase();
+  if (value === 'false' || value === '0') return false;
+  if (value === 'true' || value === '1') return true;
+  return getSmtpPort() === 465;
 }
 
 function getTransporter() {
   if (!smtpConfigured()) return null;
   if (transporter) return transporter;
 
-  const port = parseInt(process.env.SMTP_PORT, 10) || 465;
-  const secure = process.env.SMTP_SECURE !== 'false' && port === 465;
+  const port = getSmtpPort();
+  const secure = getSmtpSecure();
 
   transporter = nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
+    host: env('SMTP_HOST'),
     port,
     secure,
     auth: {
-      user: process.env.SMTP_USER,
-      pass: process.env.SMTP_PASS,
+      user: env('SMTP_USER'),
+      pass: getSmtpPass(),
     },
-    connectionTimeout: 15_000,
-    greetingTimeout: 15_000,
-    socketTimeout: 20_000,
-    ...(port === 587 ? { requireTLS: true } : {}),
+    connectionTimeout: 20_000,
+    greetingTimeout: 20_000,
+    socketTimeout: 25_000,
+    ...(port === 587 && !secure ? { requireTLS: true } : {}),
   });
 
   return transporter;
 }
 
-function getSmtpUser() {
-  return process.env.SMTP_USER?.trim() || '';
-}
-
 function getFromAddress() {
-  const user = getSmtpUser();
-  const from = process.env.SMTP_FROM?.trim();
-  if (from) {
-    const match = from.match(/<([^>]+)>/);
-    const fromEmail = (match ? match[1] : from).trim().toLowerCase();
-    if (user && fromEmail !== user.toLowerCase()) {
-      console.warn(
-        `SMTP_FROM (${fromEmail}) should match SMTP_USER (${user}) on Hostinger — using SMTP_USER as sender`
-      );
-      return `"EganirA" <${user}>`;
-    }
-    return from;
-  }
+  if (env('SMTP_FROM')) return env('SMTP_FROM');
+  const user = env('SMTP_USER');
   return user ? `"EganirA" <${user}>` : '"EganirA" <noreply@localhost>';
 }
 
-async function verifySmtpConnection() {
+function getSmtpConfigForLog() {
+  return {
+    host: env('SMTP_HOST') || null,
+    port: getSmtpPort(),
+    secure: getSmtpSecure(),
+    user: env('SMTP_USER') || null,
+    from: getFromAddress(),
+    reply_to: env('SMTP_REPLY_TO') || env('SMTP_USER') || null,
+    http_port: env('PORT') || '4000',
+  };
+}
+
+function logSmtpConfig() {
+  const cfg = getSmtpConfigForLog();
   if (!smtpConfigured()) {
-    console.warn(
-      '⚠️  SMTP not configured — password reset emails will NOT send. Set SMTP_HOST, SMTP_USER, SMTP_PASS (and APP_URL) in server environment.'
-    );
-    return false;
+    console.warn('⚠️  SMTP not configured — set SMTP_HOST, SMTP_USER, SMTP_PASS in environment');
+    return;
   }
+  console.log(
+    `📬 SMTP from environment: ${cfg.host}:${cfg.port} secure=${cfg.secure} user=${cfg.user} (HTTP PORT=${cfg.http_port})`
+  );
+}
+
+async function verifySmtpConnection() {
+  logSmtpConfig();
+  if (!smtpConfigured()) return false;
 
   try {
-    const transport = getTransporter();
-    await transport.verify();
-    const port = parseInt(process.env.SMTP_PORT, 10) || 465;
-    console.log(`✅ SMTP verified (${process.env.SMTP_HOST}:${port} as ${getSmtpUser()})`);
+    await getTransporter().verify();
+    const cfg = getSmtpConfigForLog();
+    console.log(`✅ SMTP verified (${cfg.host}:${cfg.port} as ${cfg.user})`);
     return true;
   } catch (err) {
     console.error('❌ SMTP verification failed:', err.message);
-    if (parseInt(process.env.SMTP_PORT, 10) === 465) {
-      console.error('   Tip: try SMTP_PORT=587 and SMTP_SECURE=false if port 465 is blocked.');
-    }
     return false;
   }
 }
 
 function getAppUrl() {
-  const explicit = process.env.APP_URL?.trim();
+  const explicit = env('APP_URL');
   if (explicit) return explicit.replace(/\/$/, '');
-  const client = process.env.CLIENT_URL?.split(',')[0]?.trim();
+  const client = env('CLIENT_URL').split(',')[0];
   if (client) return client.replace(/\/$/, '');
   return 'http://localhost:5173';
 }
@@ -120,13 +144,13 @@ async function sendPasswordResetEmail({ to, username, resetUrl }) {
     </div>
   `;
 
-  const smtpUser = getSmtpUser();
+  const smtpUser = env('SMTP_USER');
   const info = await transport.sendMail({
     from: getFromAddress(),
     to,
-    replyTo: process.env.SMTP_REPLY_TO || smtpUser,
+    replyTo: env('SMTP_REPLY_TO') || smtpUser,
     envelope: {
-      from: smtpUser || getFromAddress(),
+      from: smtpUser,
       to,
     },
     subject,
@@ -141,7 +165,7 @@ async function sendPasswordResetEmail({ to, username, resetUrl }) {
 module.exports = {
   smtpConfigured,
   getAppUrl,
-  getSmtpUser,
+  getSmtpConfigForLog,
   verifySmtpConnection,
   sendPasswordResetEmail,
 };

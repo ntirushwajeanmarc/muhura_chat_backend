@@ -15,7 +15,7 @@ async function main() {
   }
 
   if (!smtpConfigured()) {
-    console.error('SMTP_HOST, SMTP_USER, and SMTP_PASS must be set in backend/.env');
+    console.error('Set SMTP_HOST, SMTP_USER, and SMTP_PASS in environment');
     process.exit(1);
   }
 
