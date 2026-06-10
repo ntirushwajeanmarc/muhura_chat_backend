@@ -73,6 +73,7 @@ const initDB = async () => {
       ALTER TABLE messages ADD COLUMN IF NOT EXISTS call_type VARCHAR(10);
       ALTER TABLE messages ADD COLUMN IF NOT EXISTS call_status VARCHAR(20);
       ALTER TABLE messages ADD COLUMN IF NOT EXISTS call_duration_secs INTEGER;
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS star_reply_id UUID REFERENCES stars(id) ON DELETE SET NULL;
 
       CREATE INDEX IF NOT EXISTS idx_messages_room_created ON messages(room_id, created_at DESC);
 
@@ -149,6 +150,18 @@ const initDB = async () => {
       );
 
       CREATE INDEX IF NOT EXISTS idx_fcm_tokens_user ON fcm_tokens(user_id);
+
+      CREATE TABLE IF NOT EXISTS password_reset_tokens (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        token_hash VARCHAR(64) NOT NULL,
+        expires_at TIMESTAMPTZ NOT NULL,
+        used_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_password_reset_token_hash ON password_reset_tokens(token_hash);
+      CREATE INDEX IF NOT EXISTS idx_password_reset_user ON password_reset_tokens(user_id);
     `);
 
     // Merge duplicate rooms (keeps oldest per name, moves messages to kept room)

@@ -19,6 +19,7 @@ const {
   notifyIncomingCall,
 } = require('./push');
 const { router: gifsRouter, initGifRoutes } = require('./gifs');
+const { resolveStarReply, formatStarReplyRow } = require('./starReply');
 const { bufferToBase64, resolveStoredBytes } = require('./fileStorage');
 const {
   getPresenceAudience,
@@ -99,6 +100,8 @@ function formatMessageRow(row) {
       content: row.reply_content,
     };
   }
+  const starReply = formatStarReplyRow(row);
+  if (starReply) msg.star_reply = starReply;
   if (row.like_count !== undefined && row.like_count !== null) {
     msg.likes = {
       count: parseInt(row.like_count, 10) || 0,
@@ -116,7 +119,7 @@ function formatMessageRow(row) {
   return msg;
 }
 
-function buildLiveMessage(row, socketUser, roomId, replyTo = null) {
+function buildLiveMessage(row, socketUser, roomId, replyTo = null, starReply = null) {
   const msg = {
     id: row.id,
     content: row.content,
@@ -128,6 +131,7 @@ function buildLiveMessage(row, socketUser, roomId, replyTo = null) {
     room_id: roomId,
     reply_to: replyTo,
   };
+  if (starReply) msg.star_reply = starReply;
   if (row.attachment_url) {
     msg.attachment = {
       url: row.attachment_url,
@@ -1043,10 +1047,16 @@ function messageSelectSql(viewerIdParam) {
   return `
   SELECT m.id, m.content, m.created_at, m.edited_at, m.reply_to_id,
          m.message_type, m.call_type, m.call_status, m.call_duration_secs,
+         m.star_reply_id,
          m.attachment_url, m.attachment_name, m.attachment_mime,
          u.id AS user_id, u.username, u.avatar_color, u.avatar_url,
          ru.username AS reply_username,
          rm.content AS reply_content,
+         sr.content AS star_reply_content,
+         sr.image_mime AS star_reply_image_mime,
+         (sr.image_data IS NOT NULL) AS star_reply_has_image,
+         su.username AS star_reply_username,
+         su.id AS star_reply_user_id,
          (SELECT COUNT(*)::int FROM message_likes ml WHERE ml.message_id = m.id) AS like_count,
          EXISTS(
            SELECT 1 FROM message_likes ml2
@@ -1056,6 +1066,8 @@ function messageSelectSql(viewerIdParam) {
   JOIN users u ON m.user_id = u.id
   LEFT JOIN messages rm ON m.reply_to_id = rm.id
   LEFT JOIN users ru ON rm.user_id = ru.id
+  LEFT JOIN stars sr ON m.star_reply_id = sr.id
+  LEFT JOIN users su ON sr.user_id = su.id
 `;
 }
 
@@ -1579,7 +1591,7 @@ io.on('connection', async (socket) => {
     io.to(roomId).emit('online_users', { roomId, users: [...onlineUsers.get(roomId)] });
   });
 
-  socket.on('send_message', async ({ roomId, content, replyToId }) => {
+  socket.on('send_message', async ({ roomId, content, replyToId, starReplyId }) => {
     if (!content?.trim()) {
       socket.emit('message_error', { roomId, error: 'Message cannot be empty' });
       return;
@@ -1606,15 +1618,41 @@ io.on('connection', async (socket) => {
         }
       }
 
+      let starReply = null;
+      if (starReplyId) {
+        const resolved = await resolveStarReply(starReplyId, socket.user.id);
+        if (resolved.error) {
+          socket.emit('message_error', { roomId, error: resolved.error });
+          return;
+        }
+        starReply = resolved.starReply;
+
+        const roomRow = await pool.query(
+          `SELECT r.type FROM rooms r WHERE r.id = $1`,
+          [roomId]
+        );
+        if (roomRow.rows[0]?.type === 'direct') {
+          const members = await pool.query(
+            'SELECT user_id FROM room_members WHERE room_id = $1',
+            [roomId]
+          );
+          const memberIds = members.rows.map((m) => m.user_id);
+          if (!memberIds.includes(starReply.user_id)) {
+            socket.emit('message_error', { roomId, error: 'Star reply must be sent in a chat with the star owner' });
+            return;
+          }
+        }
+      }
+
       await ensureChannelMembership(socket.user.id, roomId);
 
       const result = await pool.query(
-        `INSERT INTO messages (room_id, user_id, content, reply_to_id)
-         VALUES ($1, $2, $3, $4)
+        `INSERT INTO messages (room_id, user_id, content, reply_to_id, star_reply_id)
+         VALUES ($1, $2, $3, $4, $5)
          RETURNING id, content, created_at, attachment_url, attachment_name, attachment_mime`,
-        [roomId, socket.user.id, content.trim(), replyTo?.id || null]
+        [roomId, socket.user.id, content.trim(), replyTo?.id || null, starReply?.id || null]
       );
-      const msg = buildLiveMessage(result.rows[0], socket.user, roomId, replyTo);
+      const msg = buildLiveMessage(result.rows[0], socket.user, roomId, replyTo, starReply);
       io.to(roomId).emit('new_message', msg);
       notifyRoomMessage(msg, socket.user.id).catch(() => {});
     } catch (err) {

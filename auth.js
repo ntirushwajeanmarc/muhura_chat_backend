@@ -3,6 +3,11 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
 const { pool } = require('./db');
+const {
+  requestPasswordReset,
+  resetPasswordWithToken,
+  verifyResetToken,
+} = require('./passwordReset');
 
 const router = express.Router();
 
@@ -12,6 +17,14 @@ const authLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many attempts. Please try again in 15 minutes.' },
+});
+
+const forgotPasswordLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many reset requests. Please try again in an hour.' },
 });
 
 const COLORS = ['#6366f1','#ec4899','#14b8a6','#f59e0b','#10b981','#3b82f6','#8b5cf6','#ef4444'];
@@ -101,6 +114,49 @@ router.post('/login', authLimiter, async (req, res) => {
     const token = issueToken(formatUser(user));
     res.json({ token, user: formatUser(user) });
   } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Request password reset email
+router.post('/forgot-password', forgotPasswordLimiter, async (req, res) => {
+  try {
+    const result = await requestPasswordReset(req.body?.email);
+    if (!result.ok) {
+      return res.status(result.status).json({ error: result.error });
+    }
+    res.json({ message: result.message });
+  } catch (err) {
+    console.error('Forgot password error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Check reset token (optional — used by frontend before showing form)
+router.get('/reset-password/verify', async (req, res) => {
+  try {
+    const { valid } = await verifyResetToken(req.query.token);
+    if (!valid) {
+      return res.status(400).json({ valid: false, error: 'Invalid or expired reset link' });
+    }
+    res.json({ valid: true });
+  } catch (err) {
+    console.error('Verify reset token error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Set new password with reset token
+router.post('/reset-password', authLimiter, async (req, res) => {
+  try {
+    const { token, password } = req.body || {};
+    const result = await resetPasswordWithToken(token, password);
+    if (!result.ok) {
+      return res.status(result.status).json({ error: result.error });
+    }
+    res.json({ message: result.message });
+  } catch (err) {
+    console.error('Reset password error:', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
