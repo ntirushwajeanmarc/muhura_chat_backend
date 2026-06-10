@@ -1,9 +1,16 @@
+const dns = require('dns').promises;
 const nodemailer = require('nodemailer');
 
 let transporter = null;
+let resolvedSmtpEndpoint = null;
 
 function env(key) {
   return (process.env[key] || '').trim();
+}
+
+function envInt(key, fallback) {
+  const parsed = parseInt(env(key), 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
 }
 
 /** Strip accidental quotes if password was pasted with '...' in hosting UI */
@@ -34,30 +41,97 @@ function getSmtpSecure() {
   return getSmtpPort() === 465;
 }
 
-function getTransporter() {
-  if (!smtpConfigured()) return null;
-  if (transporter) return transporter;
+function getSmtpRetryAttempts() {
+  return Math.max(1, envInt('SMTP_RETRY_ATTEMPTS', 3));
+}
 
+function getSmtpRetryDelayMs() {
+  return Math.max(250, envInt('SMTP_RETRY_DELAY_MS', 1500));
+}
+
+/** Hostinger is picky — resolve IPv4 up front so the TCP handshake starts immediately. */
+async function resolveSmtpEndpoint() {
+  if (resolvedSmtpEndpoint) return resolvedSmtpEndpoint;
+
+  const hostname = env('SMTP_HOST');
+  try {
+    const { address } = await dns.lookup(hostname, { family: 4 });
+    resolvedSmtpEndpoint = { hostname, address };
+  } catch {
+    resolvedSmtpEndpoint = { hostname, address: hostname };
+  }
+  return resolvedSmtpEndpoint;
+}
+
+function buildTransportOptions(endpoint) {
   const port = getSmtpPort();
   const secure = getSmtpSecure();
 
-  transporter = nodemailer.createTransport({
-    host: env('SMTP_HOST'),
+  return {
+    host: endpoint.address,
     port,
     secure,
-    // Render/cloud often has no IPv6 route — Hostinger resolves to IPv6 and fails with ENETUNREACH
+    // EHLO identity must stay the real hostname, not the resolved IP
+    name: endpoint.hostname,
     family: 4,
     auth: {
       user: env('SMTP_USER'),
       pass: getSmtpPass(),
     },
-    connectionTimeout: 20_000,
-    greetingTimeout: 20_000,
-    socketTimeout: 25_000,
+    tls: {
+      servername: endpoint.hostname,
+      minVersion: 'TLSv1.2',
+    },
+    // Hostinger drops slow clients — fail fast, then retry quickly
+    connectionTimeout: envInt('SMTP_CONNECTION_TIMEOUT_MS', 12_000),
+    greetingTimeout: envInt('SMTP_GREETING_TIMEOUT_MS', 8_000),
+    socketTimeout: envInt('SMTP_SOCKET_TIMEOUT_MS', 15_000),
     ...(port === 587 && !secure ? { requireTLS: true } : {}),
-  });
+  };
+}
 
+async function createTransporter() {
+  const endpoint = await resolveSmtpEndpoint();
+  return nodemailer.createTransport(buildTransportOptions(endpoint));
+}
+
+async function getTransporter() {
+  if (!smtpConfigured()) return null;
+  if (transporter) return transporter;
+  transporter = await createTransporter();
   return transporter;
+}
+
+function resetTransporter() {
+  if (transporter) {
+    try {
+      transporter.close();
+    } catch {
+      // ignore close errors between retries
+    }
+  }
+  transporter = null;
+}
+
+async function withSmtpRetry(label, operation) {
+  const attempts = getSmtpRetryAttempts();
+  const delayMs = getSmtpRetryDelayMs();
+  let lastErr;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      resetTransporter();
+      return await operation(await createTransporter());
+    } catch (err) {
+      lastErr = err;
+      if (attempt < attempts) {
+        console.warn(`⚠️  SMTP ${label} attempt ${attempt}/${attempts} failed (${err.message}), retrying in ${delayMs}ms…`);
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
+  }
+
+  throw lastErr;
 }
 
 function getFromAddress() {
@@ -75,6 +149,7 @@ function getSmtpConfigForLog() {
     from: getFromAddress(),
     reply_to: env('SMTP_REPLY_TO') || env('SMTP_USER') || null,
     http_port: env('PORT') || '4000',
+    retry_attempts: getSmtpRetryAttempts(),
   };
 }
 
@@ -84,30 +159,41 @@ function logSmtpConfig() {
     console.warn('⚠️  SMTP not configured — set SMTP_HOST, SMTP_USER, SMTP_PASS in environment');
     return;
   }
-  console.log(`📬 SMTP mail server: ${cfg.host}:${cfg.port} secure=${cfg.secure} user=${cfg.user} (IPv4)`);
+  console.log(`📬 SMTP mail server: ${cfg.host}:${cfg.port} secure=${cfg.secure} user=${cfg.user} (IPv4, ${cfg.retry_attempts} attempts)`);
   console.log(`🌐 HTTP web server will use PORT=${cfg.http_port} (separate from SMTP_PORT)`);
 }
 
+function logSmtpFailure(err) {
+  console.error('❌ SMTP verification failed:', err.message);
+  const msg = String(err.message || '').toLowerCase();
+  if (msg.includes('enetunreach')) {
+    console.error('   IPv6 route unavailable — using IPv4 lookup + family: 4.');
+  }
+  if (msg.includes('timeout') || msg.includes('timed out') || err.code === 'ETIMEDOUT') {
+    console.error('   Hostinger SMTP is strict on timing — DNS + TLS must finish quickly.');
+    console.error('   Retries are enabled; if all attempts fail, check Render SMTP egress or try SMTP_PORT=587 SMTP_SECURE=false.');
+  }
+}
+
 async function verifySmtpConnection() {
+  if (env('SMTP_SKIP_VERIFY').toLowerCase() === 'true') {
+    logSmtpConfig();
+    console.log('⏭️  SMTP startup verify skipped (SMTP_SKIP_VERIFY=true)');
+    return true;
+  }
+
   logSmtpConfig();
   if (!smtpConfigured()) return false;
 
   try {
-    await getTransporter().verify();
+    await withSmtpRetry('verify', (transport) => transport.verify());
+    transporter = await createTransporter();
     const cfg = getSmtpConfigForLog();
     console.log(`✅ SMTP verified (${cfg.host}:${cfg.port} as ${cfg.user})`);
     return true;
   } catch (err) {
-    console.error('❌ SMTP verification failed:', err.message);
-    const msg = String(err.message || '').toLowerCase();
-    if (msg.includes('enetunreach')) {
-      console.error('   IPv6 route unavailable — connection forced to IPv4 (family: 4). Redeploy if this persists.');
-    }
-    if (msg.includes('timeout') || msg.includes('timed out') || err.code === 'ETIMEDOUT') {
-      console.error('   Outbound SMTP to ports 465/587 is often blocked on free PaaS hosts (e.g. Render free tier).');
-      console.error('   Your config looks correct — upgrade to a paid Render instance, or run the API on Hostinger/VPS where SMTP works.');
-      console.error('   HTTP PORT and SMTP_PORT are unrelated; this is not a port mix-up.');
-    }
+    logSmtpFailure(err);
+    resetTransporter();
     return false;
   }
 }
@@ -121,8 +207,7 @@ function getAppUrl() {
 }
 
 async function sendPasswordResetEmail({ to, username, resetUrl }) {
-  const transport = getTransporter();
-  if (!transport) {
+  if (!smtpConfigured()) {
     throw new Error('Email is not configured on the server');
   }
 
@@ -155,7 +240,7 @@ async function sendPasswordResetEmail({ to, username, resetUrl }) {
   `;
 
   const smtpUser = env('SMTP_USER');
-  const info = await transport.sendMail({
+  const mailOptions = {
     from: getFromAddress(),
     to,
     replyTo: env('SMTP_REPLY_TO') || smtpUser,
@@ -166,7 +251,10 @@ async function sendPasswordResetEmail({ to, username, resetUrl }) {
     subject,
     text,
     html,
-  });
+  };
+
+  const info = await withSmtpRetry('send', (transport) => transport.sendMail(mailOptions));
+  transporter = await createTransporter();
 
   console.log(`📧 Password reset sent to ${to} (messageId: ${info.messageId || 'n/a'})`);
   return info;
