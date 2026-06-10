@@ -341,7 +341,10 @@ const io = new Server(server, {
     origin: allowedOrigins,
     methods: ['GET', 'POST'],
     credentials: true,
-  }
+  },
+  // Mobile/PWA: longer timeouts before the server drops a slow background socket
+  pingTimeout: 60000,
+  pingInterval: 25000,
 });
 
 app.set('io', io);
