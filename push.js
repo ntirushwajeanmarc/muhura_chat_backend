@@ -3,6 +3,7 @@ const webpush = require('web-push');
 const { pool } = require('./db');
 const { authenticate } = require('./auth');
 const { sendFcmToUser } = require('./fcm');
+const { parseMentionUsernames } = require('./mentions');
 
 const router = express.Router();
 
@@ -26,6 +27,7 @@ function isConfigured() {
 }
 
 function messagePreview(msg) {
+  if (msg.deleted_at) return 'Message deleted';
   if (msg.attachment) {
     const mime = msg.attachment.mime || '';
     const name = msg.attachment.name || '';
@@ -92,6 +94,18 @@ async function sendToUser(userId, payload) {
   await Promise.allSettled(tasks);
 }
 
+async function getUserIdsByUsernames(usernames, roomId) {
+  if (!usernames.length) return new Map();
+  const result = await pool.query(
+    `SELECT u.id, LOWER(u.username) AS username
+     FROM users u
+     INNER JOIN room_members rm ON rm.user_id = u.id AND rm.room_id = $1
+     WHERE LOWER(u.username) = ANY($2::text[])`,
+    [roomId, usernames]
+  );
+  return new Map(result.rows.map((row) => [row.username, row.id]));
+}
+
 async function notifyRoomMessage(msg, senderUserId) {
   if (!msg?.room_id) return;
 
@@ -101,21 +115,31 @@ async function notifyRoomMessage(msg, senderUserId) {
   const room = await getRoomInfo(msg.room_id);
   const preview = messagePreview(msg);
   const sender = msg.username || 'Someone';
-  const body = room?.type === 'direct'
-    ? `${sender}: ${preview}`
-    : `${sender} in #${room?.name || 'chat'}: ${preview}`;
+  const mentionedNames = parseMentionUsernames(msg.content);
+  const mentionedIds = await getUserIdsByUsernames(mentionedNames, msg.room_id);
 
   await Promise.allSettled(
-    memberIds.map((userId) =>
-      sendToUser(userId, {
+    memberIds.map((userId) => {
+      const isMentioned = [...mentionedIds.values()].includes(userId);
+      let body;
+      if (isMentioned) {
+        body = room?.type === 'direct'
+          ? `${sender} mentioned you: ${preview}`
+          : `${sender} mentioned you in #${room?.name || 'chat'}: ${preview}`;
+      } else {
+        body = room?.type === 'direct'
+          ? `${sender}: ${preview}`
+          : `${sender} in #${room?.name || 'chat'}: ${preview}`;
+      }
+      return sendToUser(userId, {
         title: 'EganirA',
         body,
         type: 'message',
         roomId: msg.room_id,
         url: `/?room=${msg.room_id}`,
         silent: false,
-      })
-    )
+      });
+    })
   );
 }
 

@@ -23,6 +23,7 @@ const {
 } = require('./push');
 const { router: gifsRouter, initGifRoutes } = require('./gifs');
 const { resolveStarReply, formatStarReplyRow } = require('./starReply');
+const { parseMentionUsernames } = require('./mentions');
 const { bufferToBase64, resolveStoredBytes } = require('./fileStorage');
 const {
   getPresenceAudience,
@@ -107,6 +108,11 @@ function formatMessageRow(row) {
     avatar_color: row.avatar_color,
     avatar_url: row.avatar_url || null,
   };
+  if (row.deleted_at) {
+    msg.deleted_at = row.deleted_at;
+    msg.content = '';
+    return msg;
+  }
   if (row.edited_at) msg.edited_at = row.edited_at;
   if (row.attachment_url) {
     msg.attachment = {
@@ -1169,13 +1175,13 @@ const MESSAGE_PAGE_MAX = 100;
 
 function messageSelectSql(viewerIdParam) {
   return `
-  SELECT m.id, m.content, m.created_at, m.edited_at, m.reply_to_id,
+  SELECT m.id, m.content, m.created_at, m.edited_at, m.deleted_at, m.reply_to_id,
          m.message_type, m.call_type, m.call_status, m.call_duration_secs,
          m.star_reply_id,
          m.attachment_url, m.attachment_name, m.attachment_mime,
          u.id AS user_id, u.username, u.avatar_color, u.avatar_url,
          ru.username AS reply_username,
-         rm.content AS reply_content,
+         CASE WHEN rm.deleted_at IS NOT NULL THEN 'Message deleted' ELSE rm.content END AS reply_content,
          sr.content AS star_reply_content,
          sr.background_color AS star_reply_background_color,
          sr.image_mime AS star_reply_image_mime,
@@ -1336,7 +1342,7 @@ app.get('/api/rooms/:roomId/messages/search', authenticate, async (req, res) => 
 
     const result = await pool.query(
       `${messageSelectSql(3)}
-       WHERE m.room_id = $1 AND m.content ILIKE $2
+       WHERE m.room_id = $1 AND m.deleted_at IS NULL AND m.content ILIKE $2
        ORDER BY m.created_at DESC
        LIMIT $4`,
       [roomId, pattern, req.user.id, limit]
@@ -1511,13 +1517,14 @@ async function updateMessageContent(userId, roomId, messageId, content) {
   }
 
   const existing = await pool.query(
-    `SELECT m.id, m.user_id, m.attachment_url
+    `SELECT m.id, m.user_id, m.attachment_url, m.deleted_at
      FROM messages m WHERE m.id = $1 AND m.room_id = $2`,
     [messageId, roomId]
   );
   const row = existing.rows[0];
   if (!row) return { error: 'Message not found', status: 404 };
   if (row.user_id !== userId) return { error: 'You can only edit your own messages', status: 403 };
+  if (row.deleted_at) return { error: 'Deleted messages cannot be edited', status: 400 };
 
   const trimmed = (content || '').trim();
   if (!trimmed && !row.attachment_url) {
@@ -1596,6 +1603,73 @@ app.patch('/api/rooms/:roomId/messages/:messageId', authenticate, async (req, re
     res.json({ message: result.message });
   } catch (err) {
     console.error('Edit message error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+async function deleteMessage(userId, roomId, messageId) {
+  if (!(await canAccessRoom(userId, roomId))) {
+    return { error: 'Access denied', status: 403 };
+  }
+
+  const existing = await pool.query(
+    `SELECT m.id, m.user_id, m.message_type, m.deleted_at
+     FROM messages m WHERE m.id = $1 AND m.room_id = $2`,
+    [messageId, roomId]
+  );
+  const row = existing.rows[0];
+  if (!row) return { error: 'Message not found', status: 404 };
+  if (row.user_id !== userId) return { error: 'You can only unsend your own messages', status: 403 };
+  if (row.deleted_at) return { error: 'Message already deleted', status: 400 };
+  if (row.message_type === 'call') return { error: 'Call history cannot be deleted', status: 400 };
+
+  await pool.query(
+    `UPDATE messages
+     SET deleted_at = NOW(), content = '',
+         attachment_url = NULL, attachment_name = NULL,
+         attachment_mime = NULL, attachment_data = NULL
+     WHERE id = $1`,
+    [messageId]
+  );
+
+  const full = await pool.query(`${messageSelectSql(2)} WHERE m.id = $1`, [messageId, userId]);
+  const msg = formatMessageRow(full.rows[0]);
+  msg.room_id = roomId;
+  return { message: msg };
+}
+
+app.delete('/api/rooms/:roomId/messages/:messageId', authenticate, async (req, res) => {
+  try {
+    const { roomId, messageId } = req.params;
+    const result = await deleteMessage(req.user.id, roomId, messageId);
+    if (result.error) return res.status(result.status).json({ error: result.error });
+
+    io.to(roomId).emit('message_deleted', result.message);
+    res.json({ message: result.message });
+  } catch (err) {
+    console.error('Delete message error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/rooms/:roomId/mentionable-users', authenticate, async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    if (!(await canAccessRoom(req.user.id, roomId))) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const result = await pool.query(
+      `SELECT u.id, u.username, u.surname, u.avatar_color, u.avatar_url
+       FROM room_members rm
+       JOIN users u ON u.id = rm.user_id
+       WHERE rm.room_id = $1 AND rm.user_id <> $2
+       ORDER BY u.username`,
+      [roomId, req.user.id]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Mentionable users error:', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -1805,6 +1879,17 @@ io.on('connection', async (socket) => {
       io.to(roomId).emit('message_edited', result.message);
     } catch (err) {
       console.error('Edit message error:', err);
+    }
+  });
+
+  socket.on('delete_message', async ({ roomId, messageId }) => {
+    if (!roomId || !messageId) return;
+    try {
+      const result = await deleteMessage(socket.user.id, roomId, messageId);
+      if (result.error) return;
+      io.to(roomId).emit('message_deleted', result.message);
+    } catch (err) {
+      console.error('Delete message error:', err);
     }
   });
 

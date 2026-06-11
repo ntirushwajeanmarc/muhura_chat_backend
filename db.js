@@ -80,6 +80,7 @@ const initDB = async () => {
       ALTER TABLE messages ADD COLUMN IF NOT EXISTS call_status VARCHAR(20);
       ALTER TABLE messages ADD COLUMN IF NOT EXISTS call_duration_secs INTEGER;
       ALTER TABLE messages ADD COLUMN IF NOT EXISTS star_reply_id UUID REFERENCES stars(id) ON DELETE SET NULL;
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 
       CREATE INDEX IF NOT EXISTS idx_messages_room_created ON messages(room_id, created_at DESC);
 
